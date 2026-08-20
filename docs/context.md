@@ -79,10 +79,12 @@ form, it is searchable.
 
 | Component | Version | File | Purpose | Status |
 |---|---|---|---|---|
-| Shared config library | 1.0.0 | `src/FileCabinet/SuiteScripts/WorkInstructions/lib/wi_lib_config.js` | Confirmed script IDs for the config record and the Task field. Constants only so far. | Not deployed |
-| Button user event | — | — | "Create Work Instruction" button | Not written |
-| Picker Suitelet | — | — | Choose work instruction, open Task on correct form | Not written |
-| Task user event | — | — | `beforeLoad` value application and safety net | Not written |
+| Shared config library | 1.1.0 | `lib/wi_lib_config.js` | All script IDs, plus the only reads of `customrecord_wi_config` | Not deployed |
+| Source button user event | 1.0.0 | `wi_ue_source_button.js` | "Create Work Instruction" button on Opportunity and Customer | Not deployed |
+| Picker Suitelet | 1.0.0 | `wi_sl_picker.js` | Choose the work instruction, open a Task on its form | Not deployed |
+| Task prefill user event | 1.0.0 | `wi_ue_task_prefill.js` | `beforeLoad` value application on a new Task | Not deployed |
+
+All paths are relative to `src/FileCabinet/SuiteScripts/WorkInstructions/`.
 
 Versioning convention: semver. Each script carries a `VERSION` constant and a JSDoc `@version`
 header, and the two are kept in step with each other and with this table.
@@ -143,11 +145,15 @@ The **priority** rule: normalise the raw stored value — trim and uppercase —
 NetSuite's native Task priority values `HIGH`, `MEDIUM`, `LOW`. **If it does not map, leave
 priority unset and log the raw value at audit level rather than guessing.**
 
-> **Unresolved — see section 10.** Whether trim-and-uppercase is the correct normalisation
-> depends on what kind of list `custrecord_wi_default_priority` is. If it sources from NetSuite's
-> native Task Priority list, the stored values genuinely are `HIGH`/`MEDIUM`/`LOW` and the rule is
-> right. If it is a hand-built custom list, `getValue()` returns a **numeric internal ID** and the
-> rule would never match. Do not implement the mapping until this is confirmed.
+**Read the priority as TEXT — `getText()`, never `getValue()`.** The field's underlying type was
+never definitively established: it may be a List/Record sourced from the native Task Priority list,
+or a hand-built custom list. **Text was chosen deliberately because it is correct either way** —
+both display *High* / *Medium* / *Low*. Mapping on option internal IDs would be wrong, because for
+a custom list those are environment-specific and would break in a second account.
+
+If the text does not map, `WI_PRIORITY_UNMAPPED` logs **both** the raw `getText()` and the raw
+`getValue()`. If the assumption above is ever wrong, that log line names the exact value that
+failed.
 
 **Button user event** — on Opportunity (and Customer, to be confirmed — see section 10).
 Adds a "Create Work Instruction" button on view. The button opens the picker Suitelet, passing
@@ -166,6 +172,19 @@ still carries a searchable type. Runs before the page renders, so it does not tr
 other script goes through it. One place to change when the configuration record changes; one
 place to look when a lookup misbehaves.
 
+### Deliberate decisions — do not silently reverse these
+
+| Decision | Why |
+|---|---|
+| **ES5 style throughout** — `var`, `function`, `'use strict'` | House convention for consistency. Not a limitation of SuiteScript 2.1. Do not modernise it. |
+| **The work instruction field is written by `wi_ue_task_prefill.js` only** | Never via the picker URL. Exactly one writer, so there is never a question of which value wins. |
+| **Task title is the config record name**, with no customer or record number | Provisional. Steve will refine it once he has seen it in use. |
+| **Priority is read as text, not as an internal ID** | See section 0 trap 4 and the note under the priority rule above. |
+| **Offset `0` means today** and is tested for explicitly, never by truthiness | `0` is falsy in JavaScript. An `if (offset)` check would silently skip the due date on exactly the records that want today. |
+| **No caching in the config library** | One search per page load is trivial governance, and a cache would risk serving a stale form ID straight after someone edits a config record. Left out deliberately, not forgotten. |
+| **`getByTypeId()` throws rather than returning null** | A missing config is always a defect — the id came from a link this feature generated. A swallowed null would produce a Task with no work instruction type, which is the exact outcome this feature exists to prevent. |
+| **`getByTypeId()` does not filter on `isinactive`** | A user may open the picker moments before a config record is deactivated. Honouring the in-flight Task beats failing it. |
+
 ### The constraint that shapes every future change
 
 **Nothing may set the custom form after the Task page has rendered.** Any proposed change that
@@ -182,9 +201,11 @@ through the pre-creation path instead.
 - **SuiteFlow formulas cannot reliably join through a List/Record field into a custom record**,
   and client-side formula evaluation is limited. This is why the routing logic here is scripted
   rather than built as a workflow.
-- **A workflow may still exist in the account** as a server-side safety net for Tasks created
-  outside this feature. If one does, it is recorded under section 10. Note that such a workflow
-  cannot set the custom form (trap 1) — at most it can populate the work instruction field.
+- **The workflow has been retired.** A SuiteFlow workflow previously attempted this routing and is
+  being deleted from the account. It failed for two reasons: SuiteFlow could not reliably set the
+  custom form, and client-side formula evaluation could not do the due date arithmetic. **Nothing
+  in NetSuite other than these scripts writes the work instruction field.** There is no second
+  writer and no ordering question. Do not reintroduce a workflow for this.
 
 ---
 
@@ -202,7 +223,12 @@ string.
 
 | Key | Meaning | What to do if it fires |
 |---|---|---|
-| `WI_TASK_CREATED` | A Task was created through the picker. Normal operation. | Nothing. Confirms the happy path. |
+| `WI_TASK_CREATED` | **Reserved — no script raises this.** A Task is created when the user saves the form, which nothing in this feature observes. Kept only so that a future session grepping for it finds this note rather than hunting for a missing logger. | Nothing. |
+| `WI_ASSIGNEE_RULE` | Records which of the three assignee branches was taken, with the raw config value and the raw source sales rep. Normal operation. | Nothing. Use it to confirm the rule behaved as expected. |
+| `WI_CONFIG_INCOMPLETE` | A config record is unusable in part: no form internal ID (excluded from the picker), or a non-numeric due date offset (due date left alone). | Populate the missing value on the named config record. |
+| `WI_PICKER_FAILED` | The picker Suitelet could not build its list. The user saw an apology, not an empty list. | Read the logged error. The picker never falls through to a default form. |
+| `WI_PREFILL_FAILED` | The Task prefill threw. The Task form still opened, unpopulated or partly populated. | Read the logged parameters. The user can complete the Task by hand meanwhile. |
+| `WI_BUTTON_FAILED` | The button could not be drawn on an Opportunity or Customer. The record still opened. | Read the logged error. Users cannot raise work instructions from that record until fixed. |
 | `WI_CONFIG_MISSING` | A Work Instruction Type record could not be read, or a required field on it was empty. | Check the configuration record exists in this account and is fully populated. See section 10. |
 | `WI_ROUTE_FAILED` | The work instruction could not be routed — form, assignee or due date could not be resolved. | Read the logged raw values. Usually a configuration gap rather than a code fault. |
 | `WI_PRIORITY_UNMAPPED` | The raw value of `custrecord_wi_default_priority` did not map to `HIGH`, `MEDIUM` or `LOW`. Priority was left unset — deliberately, not silently. | Read the logged raw value. Either the config record holds an unexpected option, or the normalisation rule is wrong. See section 4. |
@@ -220,10 +246,22 @@ Deployment is **manual File Cabinet upload**. There is no SDF project and no aut
 1. **Upload `lib/wi_lib_config.js` to the File Cabinet first.** Every other script imports it by
    relative path and they all fail *at load time* if it is absent — the failure looks like a
    broken script record, not a missing file.
-2. Upload the entry-point scripts.
-3. Create or update the script records and deployments in the NetSuite UI.
-4. Confirm the Work Instruction Type records exist and are populated **in the target account**.
-   They are data, so they do not travel with the code.
+2. Upload the entry-point scripts: `wi_ue_source_button.js`, `wi_sl_picker.js` and
+   `wi_ue_task_prefill.js`.
+3. Create or update the script records and deployments in the NetSuite UI:
+
+   | Script | Script ID | Deployments |
+   |---|---|---|
+   | `wi_sl_picker.js` | `customscript_wi_sl_picker` | `customdeploy_wi_sl_picker`. **Available Without Login: No.** |
+   | `wi_ue_source_button.js` | `customscript_wi_ue_source_button` | **Two deployments from one script record** — Opportunity and Customer |
+   | `wi_ue_task_prefill.js` | `customscript_wi_ue_task_prefill` | One deployment, Task |
+
+   The picker's script and deployment IDs are referenced by `url.resolveScript()` in
+   `wi_ue_source_button.js`. **They must match `SCRIPT_IDS` in `wi_lib_config.js` exactly** or the
+   button will throw when it builds its URL.
+4. Confirm the Work Instruction Configuration records exist and are populated **in the target
+   account**. They are data, so they do not travel with the code.
+5. Set the Suitelet deployment's audience. Not yet decided — see section 10, question 8.
 
 Shared AMD modules need no script record and no deployment record — a File Cabinet upload is
 sufficient. But **all files must sit in the same folder tree**, because the imports are relative
@@ -234,32 +272,40 @@ paths. The repo layout under `src/FileCabinet/` mirrors the File Cabinet exactly
 ## 9. Testing
 
 Manual, in Sandbox. There is no test framework in this repo and SuiteScript cannot be meaningfully
-executed outside NetSuite.
+executed outside NetSuite. Mechanical checks only were run before commit — syntax, headers,
+versions, and greps for forbidden patterns.
 
-Standard pass:
+Grep the execution log for `WI_` after every scenario.
 
-1. Create a work instruction from the button on **at least two different records**, covering more
-   than one work instruction type.
-2. Create a Task the ordinary way, **without** the button.
-3. Verify the work instruction field is populated **and searchable** in both cases — build a saved
-   search on it and confirm the record appears.
-4. Verify the due date matches the configured offset.
-5. Verify the assignee follows the section 4 rule: default assignee if populated, otherwise the
-   sales rep from the source record, otherwise empty. **Test all three branches** — a config
-   record with a default assignee, one without, and one whose source record has no sales rep.
-6. Verify the priority maps correctly, and that a config record holding an unmappable priority
-   leaves priority unset and raises `WI_PRIORITY_UNMAPPED` with the raw value.
-7. Grep the execution log for `WI_` and confirm no `WI_CONFIG_MISSING`, `WI_ROUTE_FAILED` or
-   unexpected `WI_PRIORITY_UNMAPPED`.
+| # | Scenario | Expected |
+|---|---|---|
+| 1 | Open an **Opportunity** in view mode | "Create Work Instruction" button present |
+| 2 | Open an Opportunity in **edit** and **create** mode | **No** button — view only |
+| 3 | Open a **Customer** in view mode | Button present |
+| 4 | Click the button from an Opportunity | Picker lists active types, sorted by name, one link each |
+| 5 | Click a picker link | Task opens **on that type's custom form**, title = config name, work instruction field set |
+| 6 | From an Opportunity, check the links | `company` = the Opportunity's customer, `transaction` = the Opportunity |
+| 7 | From a Customer, check the links | `company` = the Customer, `transaction` **empty** |
+| 8 | A type whose config has a **Default Assignee** | Assigned To = that employee. `WI_ASSIGNEE_RULE` logs rule 1. Live data: eight of ten records |
+| 9 | A type with **no** Default Assignee, source record **has** a sales rep | Assigned To = the source record's own sales rep. Logs rule 2. Use *Requote Required* or *Sales Contact Requested* |
+| 10 | A type with no Default Assignee, source record has **no** sales rep | Assigned To **empty**. Logs rule 3. Task still opens |
+| 11 | A config record with offset **`0`** | Due date = **today**, not blank. This is the case a truthiness bug would break |
+| 12 | A config record with a **positive** offset | Due date = today + n days |
+| 13 | A config record with a **blank** offset | Due date **left empty** — not defaulted to today |
+| 14 | A config record with **no form internal ID** | **Absent** from the picker. `WI_CONFIG_INCOMPLETE` names it |
+| 15 | Deactivate every config record, open the picker | Plain "no active work instruction types are configured" message. **No empty list, no default form** |
+| 16 | Create a Task **the ordinary way**, without the button | Task opens untouched. No prefill, no error. Work instruction field empty — Phase 3 handles this |
+| 17 | Build a saved search on `custevent_work_instruction_type` | Tasks raised via the picker appear, grouped by type. **This is the reporting failure the project exists to fix** |
+| 18 | A config record whose priority text is not High/Medium/Low | Priority **unset**, `WI_PRIORITY_UNMAPPED` logs both the text and the internal ID |
+| 19 | Confirm the picker link target | **Verify `url.resolveTaskLink({id: 'EDIT_TASK'})` resolves to the new-Task page.** If the link id is wrong the links 404 — loud and immediate, but check it first |
 
 ---
 
 ## 10. Open items
 
-### NetSuite IDs to confirm before Phase 2
+### Confirmed NetSuite IDs
 
-No script file can be written until these are filled in. Script IDs only — **no internal IDs in
-this table.**
+Script IDs only — **no internal IDs in this table.**
 
 | Item | Script ID | Type | Confirmed by | Date |
 |---|---|---|---|---|
@@ -269,23 +315,41 @@ this table.**
 | Config field: default assignee | `custrecord_wi_default_assignee` | List/Record → Employee | Steve | 2026-08-20 |
 | Config field: default priority | `custrecord_wi_default_priority` | List | Steve | 2026-08-20 |
 | Config field: due date offset (days) | `custrecord_wi_due_date_offset` | Integer | Steve | 2026-08-20 |
-| Task field holding the sourced offset | **Not provided** — see question 6 below | — | — | — |
+
+UI display name of `customrecord_wi_config` is *Work Instruction Configuration*. One record, two
+names.
 
 **Withdrawn:** *Config field: assignment source.* No such field exists and none will be created.
-The assignee rule in section 4 replaces it. Do not reintroduce it.
+The name that circulated during design was a placeholder and was never in the account, so there was
+nothing to remove. The assignee rule in section 4 replaces it. Do not reintroduce it.
+
+**Withdrawn:** *Task field holding the sourced offset.* No such field exists and none is needed —
+the offset is read from the config record at runtime.
 
 **Deprecated:** `custrecord_wi_default_form_type` — mis-built, being made inactive, must not be
 read. See trap 6 in section 0.
+
+### Closed questions
+
+| # | Question | Resolution | Closed |
+|---|---|---|---|
+| 3 | Does a workflow remain as a server-side safety net? | **No.** Retired and being deleted. These scripts are the only writer. See section 5. | 2026-08-20 |
+| 4 | Is the priority field a native or a hand-built list? | **Never established, and it does not matter.** Read as text, which is correct either way. See section 4. | 2026-08-20 |
+| 5 | Which sales rep? | The **source record's own** `salesrep`. No cross-record fallback. | 2026-08-20 |
+| 6 | Is there a Task field holding the sourced offset? | **No**, and none needed. | 2026-08-20 |
+| 7 | Which Task field links back to the source? | Native `company` and `transaction`. No custom field. See section 4. | 2026-08-20 |
 
 ### Unresolved questions
 
 | # | Question | Status |
 |---|---|---|
-| 1 | Button on Opportunity only, or Customer as well? | Unresolved |
-| 2 | Does the picker let the user override assignee and priority, or set them silently? | Unresolved |
-| 3 | Does a workflow remain in the account as a server-side safety net? If so, does it write the same field as the Task `beforeLoad`, and which wins? | Unresolved |
-| 4 | Is `custrecord_wi_default_priority` sourced from the native Task Priority list, or is it a hand-built custom list? This decides whether trim-and-uppercase normalisation works at all. **Blocks the priority logic.** | Unresolved |
-| 5 | "Sales rep from the source record" — which record, and which field? On an Opportunity, is it the Opportunity's own sales rep or the customer's? Depends on question 1. | Unresolved |
-| 6 | Is there a Task field holding the sourced due date offset, or is the due date calculated and written directly? | Unresolved |
-| 7 | Which Task field links back to the originating Opportunity or Customer? | Unresolved |
-| 8 | Which roles see the button and may run the picker Suitelet? | Unresolved |
+| 1 | Button on Opportunity only, or Customer as well? | **Open.** Built for both — one script record, two deployments. Dropping Customer means removing a deployment, not changing code. |
+| 2 | Does the picker let the user override assignee and priority, or set them silently? | **Open.** Currently silent: the picker is a one-click list and the user edits the Task afterwards. |
+| 8 | Which roles see the button and may run the picker Suitelet? | **Open.** A deployment-time decision, not a code decision — set the audience on the deployment records. The Suitelet must be **Available Without Login: No**. |
+
+### Carried into Phase 3
+
+| Item | Why it is not in this phase |
+|---|---|
+| Reverse lookup from custom form to work instruction type | A Task created without the picker carries no work instruction type and stays invisible to reporting. `wi_ue_task_prefill.js` returns immediately when the config parameter is absent. |
+| Task title refinement | Currently the config record name alone. Provisional pending Steve seeing it in use. |
