@@ -79,8 +79,9 @@ form, it is searchable.
 
 | Component | Version | File | Purpose | Status |
 |---|---|---|---|---|
-| Shared config library | 1.1.0 | `lib/wi_lib_config.js` | All script IDs, plus the only reads of `customrecord_wi_config` | Not deployed |
-| Source button user event | 1.0.0 | `wi_ue_source_button.js` | "Create Work Instruction" button on Opportunity and Customer | Not deployed |
+| Shared config library | 1.2.0 | `lib/wi_lib_config.js` | All script IDs, plus the only reads of `customrecord_wi_config` | Not deployed |
+| Source button user event | 1.1.0 | `wi_ue_source_button.js` | "Create Work Instruction" button on Opportunity and Customer | Not deployed |
+| Source button client script | 1.0.0 | `wi_cs_source_button.js` | Handles the button click. Required — see section 5 | Not deployed |
 | Picker Suitelet | 1.0.0 | `wi_sl_picker.js` | Choose the work instruction, open a Task on its form | Not deployed |
 | Task prefill user event | 1.0.0 | `wi_ue_task_prefill.js` | `beforeLoad` value application on a new Task | Not deployed |
 
@@ -195,6 +196,28 @@ through the pre-creation path instead.
 
 ## 5. Standing warnings
 
+- **`form.addButton({ functionName: ... })` takes a function NAME, never an expression.**
+  NetSuite appends `()` to whatever string it is given and invokes the result. An inline expression
+  is therefore evaluated first, and its *result* is then called. Passing
+  `"window.location.href='" + url + "'"` produced this in the Sandbox console:
+
+  ```
+  Uncaught TypeError: "/app/site/hosting/scriptlet.nl?script=3924&deploy=1&compid=472052
+  &wi_src_type=opportunity&wi_src_id=17063730" is not a function
+  ```
+
+  The URL was intact and correctly escaped — the expression evaluated to the URL string, NetSuite
+  appended `()`, and the string was called as a function. **The symptom is a `TypeError` naming the
+  evaluated expression, not a silent failure**, so the console names the problem precisely.
+
+  The fix: pass the bare name with **no parentheses** — NetSuite adds them, so
+  `'openWorkInstructionPicker()'` would produce `openWorkInstructionPicker()()`. The name must
+  match a key on the object returned by the client script **exactly, including case**. It is held
+  once as `CLIENT_FUNCTIONS.OPEN_PICKER` in `wi_lib_config.js` so the two cannot drift.
+
+  Anything the handler needs — here the resolved Suitelet URL — travels in a hidden form field,
+  not in the button wiring.
+
 - **`log.warn()` does not exist in SuiteScript.** Use `log.debug()`. Calling `log.warn()` throws.
 - **`search.lookupFields()` fails on computed fields.** Use `record.load().getValue()` for
   anything derived, formula-based or summary.
@@ -229,6 +252,8 @@ string.
 | `WI_PICKER_FAILED` | The picker Suitelet could not build its list. The user saw an apology, not an empty list. | Read the logged error. The picker never falls through to a default form. |
 | `WI_PREFILL_FAILED` | The Task prefill threw. The Task form still opened, unpopulated or partly populated. | Read the logged parameters. The user can complete the Task by hand meanwhile. |
 | `WI_BUTTON_FAILED` | The button could not be drawn on an Opportunity or Customer. The record still opened. | Read the logged error. Users cannot raise work instructions from that record until fixed. |
+| `WI_BUTTON_URL_MISSING` | The button was clicked but the hidden picker URL field was empty. The user saw an apology rather than a blank page. | The user event drew the button but not the field. Check `beforeLoad` completed — a `WI_BUTTON_FAILED` entry usually precedes this. |
+| `WI_BUTTON_CLICK_FAILED` | The client-side button handler threw. | Read the logged error and the browser console. |
 | `WI_CONFIG_MISSING` | A Work Instruction Type record could not be read, or a required field on it was empty. | Check the configuration record exists in this account and is fully populated. See section 10. |
 | `WI_ROUTE_FAILED` | The work instruction could not be routed — form, assignee or due date could not be resolved. | Read the logged raw values. Usually a configuration gap rather than a code fault. |
 | `WI_PRIORITY_UNMAPPED` | The raw value of `custrecord_wi_default_priority` did not map to `HIGH`, `MEDIUM` or `LOW`. Priority was left unset — deliberately, not silently. | Read the logged raw value. Either the config record holds an unexpected option, or the normalisation rule is wrong. See section 4. |
@@ -246,8 +271,9 @@ Deployment is **manual File Cabinet upload**. There is no SDF project and no aut
 1. **Upload `lib/wi_lib_config.js` to the File Cabinet first.** Every other script imports it by
    relative path and they all fail *at load time* if it is absent — the failure looks like a
    broken script record, not a missing file.
-2. Upload the entry-point scripts: `wi_ue_source_button.js`, `wi_sl_picker.js` and
-   `wi_ue_task_prefill.js`.
+2. Upload the entry-point scripts: `wi_ue_source_button.js`, `wi_cs_source_button.js`,
+   `wi_sl_picker.js` and `wi_ue_task_prefill.js`. **All four must sit in the same folder as each
+   other**, with `lib/` beneath them — the imports and `clientScriptModulePath` are relative paths.
 3. Create or update the script records and deployments in the NetSuite UI:
 
    | Script | Script ID | Deployments |
@@ -255,6 +281,7 @@ Deployment is **manual File Cabinet upload**. There is no SDF project and no aut
    | `wi_sl_picker.js` | `customscript_wi_sl_picker` | `customdeploy_wi_sl_picker`. **Available Without Login: No.** |
    | `wi_ue_source_button.js` | `customscript_wi_ue_source_button` | **Two deployments from one script record** — Opportunity and Customer |
    | `wi_ue_task_prefill.js` | `customscript_wi_ue_task_prefill` | One deployment, Task |
+   | `wi_cs_source_button.js` | — | **None.** Attached by the user event via `clientScriptModulePath`. Upload only — creating a script record for it is wrong |
 
    The picker's script and deployment IDs are referenced by `url.resolveScript()` in
    `wi_ue_source_button.js`. **They must match `SCRIPT_IDS` in `wi_lib_config.js` exactly** or the
@@ -280,6 +307,8 @@ Grep the execution log for `WI_` after every scenario.
 | # | Scenario | Expected |
 |---|---|---|
 | 1 | Open an **Opportunity** in view mode | "Create Work Instruction" button present |
+| 1a | **Click the button with the browser console open** | Navigates to the picker. **No `TypeError`.** This is the regression that produced the error quoted in section 5 |
+| 1b | Inspect the page source for the hidden URL field | Present and populated. If empty, the client script alerts rather than navigating to nowhere — see `WI_BUTTON_URL_MISSING` |
 | 2 | Open an Opportunity in **edit** and **create** mode | **No** button — view only |
 | 3 | Open a **Customer** in view mode | Button present |
 | 4 | Click the button from an Opportunity | Picker lists active types, sorted by name, one link each |

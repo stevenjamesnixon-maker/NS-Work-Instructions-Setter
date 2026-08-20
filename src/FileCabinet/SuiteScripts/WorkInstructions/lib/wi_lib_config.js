@@ -16,13 +16,13 @@
  *
  * @NApiVersion 2.1
  * @NModuleScope SameAccount
- * @version 1.1.0
+ * @version 1.2.0
  */
 define(['N/search', 'N/error', 'N/log'], function (search, error, log) {
 
     'use strict';
 
-    var VERSION = '1.1.0';
+    var VERSION = '1.2.0';
 
     /* ---------------------------------------------------------------------------------------
      * CONFIRMED NETSUITE IDS
@@ -138,6 +138,28 @@ define(['N/search', 'N/error', 'N/log'], function (search, error, log) {
     var SCRIPT_IDS = {
         PICKER_SUITELET: 'customscript_wi_sl_picker',
         PICKER_DEPLOYMENT: 'customdeploy_wi_sl_picker'
+    };
+
+    /**
+     * Fields this feature adds to a form at runtime. Not NetSuite configuration — these exist only
+     * for the life of the rendered page.
+     * @type {Object}
+     */
+    var FORM_FIELDS = {
+        /** Hidden. Carries the resolved picker URL from the user event to the client script. */
+        PICKER_URL: 'custpage_wi_picker_url'
+    };
+
+    /**
+     * Names of functions the client script exposes for form buttons.
+     *
+     * form.addButton({ functionName: ... }) takes a function NAME, never an expression: NetSuite
+     * appends '()' to whatever string it is given. The value here must match the key on the object
+     * returned by wi_cs_source_button.js EXACTLY, including case. See docs/context.md section 5.
+     * @type {Object}
+     */
+    var CLIENT_FUNCTIONS = {
+        OPEN_PICKER: 'openWorkInstructionPicker'
     };
 
     /**
@@ -399,6 +421,8 @@ define(['N/search', 'N/error', 'N/log'], function (search, error, log) {
         SOURCE_TYPES: SOURCE_TYPES,
         URL_PARAMS: URL_PARAMS,
         SCRIPT_IDS: SCRIPT_IDS,
+        FORM_FIELDS: FORM_FIELDS,
+        CLIENT_FUNCTIONS: CLIENT_FUNCTIONS,
         LOG_PREFIX: LOG_PREFIX,
         TASK_PRIORITIES: TASK_PRIORITIES,
         getActiveTypes: getActiveTypes,

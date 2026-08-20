@@ -7,18 +7,23 @@
  *
  * One script record, two deployments: Opportunity and Customer.
  *
+ * The click is handled by wi_cs_source_button.js, attached below via clientScriptModulePath.
+ * form.addButton takes a function NAME, never an expression — NetSuite appends '()' to whatever
+ * string it is given. See docs/context.md section 5.
+ *
  * House style is ES5 throughout — var, function, 'use strict'. Deliberate. Do not modernise.
  *
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  * @NModuleScope SameAccount
- * @version 1.0.0
+ * @version 1.1.0
  */
-define(['N/url', 'N/runtime', 'N/log', './lib/wi_lib_config'], function (url, runtime, log, wiConfig) {
+define(['N/url', 'N/runtime', 'N/ui/serverWidget', 'N/log', './lib/wi_lib_config'],
+    function (url, runtime, serverWidget, log, wiConfig) {
 
     'use strict';
 
-    var VERSION = '1.0.0';
+    var VERSION = '1.1.0';
 
     var BUTTON_ID = 'custpage_wi_create_instruction';
     var BUTTON_LABEL = 'Create Work Instruction';
@@ -62,10 +67,25 @@ define(['N/url', 'N/runtime', 'N/log', './lib/wi_lib_config'], function (url, ru
                 params: params
             });
 
+            // The URL travels to the client script in a hidden field. It cannot travel in
+            // functionName: NetSuite appends '()' to that string and invokes the result, so an
+            // inline expression evaluates to the URL and then calls it as a function.
+            var urlField = context.form.addField({
+                id: wiConfig.FORM_FIELDS.PICKER_URL,
+                type: serverWidget.FieldType.TEXT,
+                label: 'Work Instruction Picker URL'
+            });
+            urlField.updateDisplayType({ displayType: serverWidget.FieldDisplayType.HIDDEN });
+            urlField.defaultValue = pickerUrl;
+
+            // A module PATH, not a file internal id. Paths are stable across environments;
+            // clientScriptFileId would not be. Relative to this script's folder.
+            context.form.clientScriptModulePath = './wi_cs_source_button.js';
+
             context.form.addButton({
                 id: BUTTON_ID,
                 label: BUTTON_LABEL,
-                functionName: "window.location.href='" + pickerUrl + "'"
+                functionName: wiConfig.CLIENT_FUNCTIONS.OPEN_PICKER
             });
 
         } catch (e) {
