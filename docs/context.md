@@ -10,7 +10,7 @@ on. It does not describe the wider NetSuite account.
 
 ## 0. Read this first
 
-Five traps that will catch a new session before it touches anything. Each of these has already
+Six traps that will catch a new session before it touches anything. Each of these has already
 cost time on this project.
 
 1. **`customform` is not searchable and cannot be set by a workflow.**
@@ -35,6 +35,13 @@ cost time on this project.
 5. **Field IDs are used exactly as they exist in the account, typos included.**
    If an ID has a missing letter or a doubled prefix, that is the ID. Never "correct" one — the
    corrected version does not exist and the failure is silent.
+
+6. **`custrecord_wi_default_form_type` is deprecated. Do not use it.**
+   The field exists in the account and its name makes it look like the right source of the custom
+   form. It is not. It is mis-built — a List/Record pointing at the Task record type rather than
+   holding a form — and it is being made inactive. **The form comes from
+   `custrecord_wi_form_internal_id`.** This is written down so that a future session does not
+   discover the field and switch to it.
 
 ---
 
@@ -72,7 +79,10 @@ form, it is searchable.
 
 | Component | Version | File | Purpose | Status |
 |---|---|---|---|---|
-| _(none yet)_ | — | — | — | Populated from Phase 2 |
+| Shared config library | 1.0.0 | `src/FileCabinet/SuiteScripts/WorkInstructions/lib/wi_lib_config.js` | Confirmed script IDs for the config record and the Task field. Constants only so far. | Not deployed |
+| Button user event | — | — | "Create Work Instruction" button | Not written |
+| Picker Suitelet | — | — | Choose work instruction, open Task on correct form | Not written |
+| Task user event | — | — | `beforeLoad` value application and safety net | Not written |
 
 Versioning convention: semver. Each script carries a `VERSION` constant and a JSDoc `@version`
 header, and the two are kept in step with each other and with this table.
@@ -113,13 +123,31 @@ account-specific host names and script internal IDs.
 
 Four moving parts, plus the configuration record that drives all of them.
 
-**Work Instruction Type** — custom record, configured in NetSuite, **not in this repo.**
-The configuration table. One record per work instruction, holding:
-- the custom form internal ID to open the Task on
-- the default assignee
-- the assignment source
-- the default priority
-- the due date offset, in days
+**Work Instruction Type** — custom record `customrecord_wi_config`, configured in NetSuite,
+**not in this repo.** The configuration table. One record per work instruction, holding:
+
+| Holds | Field | Type |
+|---|---|---|
+| Custom form internal ID to open the Task on | `custrecord_wi_form_internal_id` | Integer |
+| Default assignee | `custrecord_wi_default_assignee` | List/Record → Employee |
+| Default priority | `custrecord_wi_default_priority` | List |
+| Due date offset, in days | `custrecord_wi_due_date_offset` | Integer |
+
+There is **no assignment source field** and none will be created. The assignee rule is, in order:
+
+1. Use **Default Assignee** if it is populated.
+2. Otherwise use the **sales rep from the source record**.
+3. Otherwise leave **Assigned To** empty.
+
+The **priority** rule: normalise the raw stored value — trim and uppercase — and map it to
+NetSuite's native Task priority values `HIGH`, `MEDIUM`, `LOW`. **If it does not map, leave
+priority unset and log the raw value at audit level rather than guessing.**
+
+> **Unresolved — see section 10.** Whether trim-and-uppercase is the correct normalisation
+> depends on what kind of list `custrecord_wi_default_priority` is. If it sources from NetSuite's
+> native Task Priority list, the stored values genuinely are `HIGH`/`MEDIUM`/`LOW` and the rule is
+> right. If it is a hand-built custom list, `getValue()` returns a **numeric internal ID** and the
+> rule would never match. Do not implement the mapping until this is confirmed.
 
 **Button user event** — on Opportunity (and Customer, to be confirmed — see section 10).
 Adds a "Create Work Instruction" button on view. The button opens the picker Suitelet, passing
@@ -177,6 +205,7 @@ string.
 | `WI_TASK_CREATED` | A Task was created through the picker. Normal operation. | Nothing. Confirms the happy path. |
 | `WI_CONFIG_MISSING` | A Work Instruction Type record could not be read, or a required field on it was empty. | Check the configuration record exists in this account and is fully populated. See section 10. |
 | `WI_ROUTE_FAILED` | The work instruction could not be routed — form, assignee or due date could not be resolved. | Read the logged raw values. Usually a configuration gap rather than a code fault. |
+| `WI_PRIORITY_UNMAPPED` | The raw value of `custrecord_wi_default_priority` did not map to `HIGH`, `MEDIUM` or `LOW`. Priority was left unset — deliberately, not silently. | Read the logged raw value. Either the config record holds an unexpected option, or the normalisation rule is wrong. See section 4. |
 
 Populate further keys as scripts are written. Log the **raw value** alongside every one of these,
 so a mismatch is visible in the execution log rather than silently doing nothing.
@@ -215,8 +244,13 @@ Standard pass:
 3. Verify the work instruction field is populated **and searchable** in both cases — build a saved
    search on it and confirm the record appears.
 4. Verify the due date matches the configured offset.
-5. Verify the assignee matches the configured default or assignment source.
-6. Grep the execution log for `WI_` and confirm no `WI_CONFIG_MISSING` or `WI_ROUTE_FAILED`.
+5. Verify the assignee follows the section 4 rule: default assignee if populated, otherwise the
+   sales rep from the source record, otherwise empty. **Test all three branches** — a config
+   record with a default assignee, one without, and one whose source record has no sales rep.
+6. Verify the priority maps correctly, and that a config record holding an unmappable priority
+   leaves priority unset and raises `WI_PRIORITY_UNMAPPED` with the raw value.
+7. Grep the execution log for `WI_` and confirm no `WI_CONFIG_MISSING`, `WI_ROUTE_FAILED` or
+   unexpected `WI_PRIORITY_UNMAPPED`.
 
 ---
 
@@ -227,16 +261,21 @@ Standard pass:
 No script file can be written until these are filled in. Script IDs only — **no internal IDs in
 this table.**
 
-| Item | Script ID | Confirmed by | Date |
-|---|---|---|---|
-| Work Instruction Type custom record | | | |
-| Task field holding the work instruction | | | |
-| Config field: custom form internal ID | | | |
-| Config field: default assignee | | | |
-| Config field: assignment source | | | |
-| Config field: default priority | | | |
-| Config field: due date offset (days) | | | |
-| Task field holding the sourced offset, if one exists | | | |
+| Item | Script ID | Type | Confirmed by | Date |
+|---|---|---|---|---|
+| Work Instruction config custom record | `customrecord_wi_config` | Custom record | Steve | 2026-08-20 |
+| Task field holding the work instruction | `custevent_work_instruction_type` | List/Record → config record | Steve | 2026-08-20 |
+| Config field: custom form internal ID | `custrecord_wi_form_internal_id` | Integer | Steve | 2026-08-20 |
+| Config field: default assignee | `custrecord_wi_default_assignee` | List/Record → Employee | Steve | 2026-08-20 |
+| Config field: default priority | `custrecord_wi_default_priority` | List | Steve | 2026-08-20 |
+| Config field: due date offset (days) | `custrecord_wi_due_date_offset` | Integer | Steve | 2026-08-20 |
+| Task field holding the sourced offset | **Not provided** — see question 6 below | — | — | — |
+
+**Withdrawn:** *Config field: assignment source.* No such field exists and none will be created.
+The assignee rule in section 4 replaces it. Do not reintroduce it.
+
+**Deprecated:** `custrecord_wi_default_form_type` — mis-built, being made inactive, must not be
+read. See trap 6 in section 0.
 
 ### Unresolved questions
 
@@ -244,4 +283,9 @@ this table.**
 |---|---|---|
 | 1 | Button on Opportunity only, or Customer as well? | Unresolved |
 | 2 | Does the picker let the user override assignee and priority, or set them silently? | Unresolved |
-| 3 | Does a workflow remain in the account as a server-side safety net? | Unresolved |
+| 3 | Does a workflow remain in the account as a server-side safety net? If so, does it write the same field as the Task `beforeLoad`, and which wins? | Unresolved |
+| 4 | Is `custrecord_wi_default_priority` sourced from the native Task Priority list, or is it a hand-built custom list? This decides whether trim-and-uppercase normalisation works at all. **Blocks the priority logic.** | Unresolved |
+| 5 | "Sales rep from the source record" — which record, and which field? On an Opportunity, is it the Opportunity's own sales rep or the customer's? Depends on question 1. | Unresolved |
+| 6 | Is there a Task field holding the sourced due date offset, or is the due date calculated and written directly? | Unresolved |
+| 7 | Which Task field links back to the originating Opportunity or Customer? | Unresolved |
+| 8 | Which roles see the button and may run the picker Suitelet? | Unresolved |
