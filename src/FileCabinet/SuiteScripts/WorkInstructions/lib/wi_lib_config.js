@@ -16,13 +16,13 @@
  *
  * @NApiVersion 2.1
  * @NModuleScope SameAccount
- * @version 1.3.0
+ * @version 1.4.0
  */
 define(['N/search', 'N/error', 'N/log'], function (search, error, log) {
 
     'use strict';
 
-    var VERSION = '1.3.0';
+    var VERSION = '1.4.0';
 
     /* ---------------------------------------------------------------------------------------
      * CONFIRMED NETSUITE IDS
@@ -273,6 +273,12 @@ define(['N/search', 'N/error', 'N/log'], function (search, error, log) {
      *   0                  -> due date is today. Deliberate and confirmed; several config
      *                         records use it intentionally.
      *   blank / non-numeric -> null, meaning leave the due date field alone entirely.
+     *   NEGATIVE           -> invalid. Treated exactly as blank, and logged as
+     *                         WI_OFFSET_INVALID. A due date in the past is never what anyone
+     *                         meant; applying it silently produces a Task that is overdue the
+     *                         moment it is created, which reads as a bug in this feature rather
+     *                         than an error in the configuration. Refusing it and saying so
+     *                         turns it into a five-second fix.
      *
      * Blank is tested for EXPLICITLY rather than by truthiness. 0 is falsy in JavaScript, so an
      * `if (offset)` check would silently skip the due date on exactly the records that legitimately
@@ -295,6 +301,17 @@ define(['N/search', 'N/error', 'N/log'], function (search, error, log) {
                 title: LOG_PREFIX + 'CONFIG_INCOMPLETE',
                 details: 'Config "' + configName + '" (id ' + configId + '): due date offset ' +
                     JSON.stringify(raw) + ' is not a whole number. Due date left alone.'
+            });
+            return null;
+        }
+
+        if (days < 0) {
+            log.audit({
+                title: LOG_PREFIX + 'OFFSET_INVALID',
+                details: 'Config "' + configName + '" (id ' + configId + '): due date offset ' +
+                    JSON.stringify(raw) + ' is negative, which would create a Task that is ' +
+                    'already overdue. Treated as unset; the due date was left alone. Correct ' +
+                    'the configuration record.'
             });
             return null;
         }
