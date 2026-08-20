@@ -10,21 +10,25 @@
  * touches the form: switching the form on a rendered record clears the very fields set below.
  * See docs/context.md section 0, trap 2.
  *
- * A Task created by any other route is left untouched in this phase. Deriving the work instruction
- * type by reverse lookup from the form is Phase 3.
+ * A Task created outside the picker still has the right custom form, because the user chose it.
+ * The work instruction type is therefore recovered from the form — see deriveTypeFromForm below.
+ * Only the type is recovered; nothing else on such a Task is touched.
+ *
+ * beforeSubmit logs changes to the work instruction type. It does not block them.
  *
  * House style is ES5 throughout — var, function, 'use strict'. Deliberate. Do not modernise.
  *
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  * @NModuleScope SameAccount
- * @version 1.0.0
+ * @version 1.1.0
  */
-define(['N/search', 'N/log', './lib/wi_lib_config'], function (search, log, wiConfig) {
+define(['N/search', 'N/runtime', 'N/log', './lib/wi_lib_config'],
+    function (search, runtime, log, wiConfig) {
 
     'use strict';
 
-    var VERSION = '1.0.0';
+    var VERSION = '1.1.0';
 
     /**
      * Reads a value from a search.lookupFields result. Select fields come back as an array of
@@ -176,6 +180,66 @@ define(['N/search', 'N/log', './lib/wi_lib_config'], function (search, log, wiCo
     }
 
     /**
+     * Path 2 and path 3 of the precedence in beforeLoad.
+     *
+     * A Task raised outside the picker carries no work instruction type and is therefore invisible
+     * to every report this feature exists to produce. The custom form is still correct, because
+     * whoever created the Task chose it, so the type is recovered from the form.
+     *
+     * ONLY the type is set. Priority, due date, assignee, company and transaction are deliberately
+     * left alone: this is a Task somebody created by hand, and they have already set those values.
+     * Overwriting them would be destructive, and recovering a missing type is the whole job here.
+     *
+     * The field is set only when it is currently empty. An existing value is never overwritten.
+     *
+     * @param {Object} newRecord
+     * @returns {void}
+     */
+    function deriveTypeFromForm(newRecord) {
+        var formId = newRecord.getValue({
+            fieldId: wiConfig.TASK_NATIVE_FIELDS.CUSTOM_FORM
+        });
+
+        var existing = newRecord.getValue({
+            fieldId: wiConfig.TASK_FIELDS.WORK_INSTRUCTION_TYPE
+        });
+
+        if (existing) {
+            log.audit({
+                title: wiConfig.LOG_PREFIX + 'PREFILL_PATH',
+                details: 'Path 2 skipped: the work instruction type is already set to ' +
+                    JSON.stringify(existing) + '. Existing values are never overwritten.'
+            });
+            return;
+        }
+
+        var config = wiConfig.getByFormId(formId);
+
+        if (config === null) {
+            // Path 3. DEBUG, not error: most Tasks in the account have nothing to do with this
+            // feature, and an error-level line on every one of them would bury real problems.
+            // An ambiguous mapping has already logged WI_FORM_AMBIGUOUS at error level.
+            log.debug({
+                title: wiConfig.LOG_PREFIX + 'FORM_UNMAPPED',
+                details: 'Form internal id ' + JSON.stringify(formId) + ' maps to no single ' +
+                    'active configuration record. Nothing was set.'
+            });
+            return;
+        }
+
+        newRecord.setValue({
+            fieldId: wiConfig.TASK_FIELDS.WORK_INSTRUCTION_TYPE,
+            value: config.id
+        });
+
+        log.audit({
+            title: wiConfig.LOG_PREFIX + 'PREFILL_PATH',
+            details: 'Path 2: recovered from form internal id ' + JSON.stringify(formId) +
+                ' as "' + config.name + '" (id ' + config.id + '). Type set; nothing else touched.'
+        });
+    }
+
+    /**
      * @param {Object} context
      * @param {Object} context.newRecord
      * @param {Object} context.request
@@ -201,10 +265,16 @@ define(['N/search', 'N/log', './lib/wi_lib_config'], function (search, log, wiCo
 
             var configId = parameters[wiConfig.URL_PARAMS.CONFIG_ID];
             if (!configId) {
-                // A Task created any other way is untouched in this phase. Phase 3 adds the
-                // reverse lookup from custom form to work instruction type.
+                // Path 2 or 3: no picker parameter, so try to recover the type from the form.
+                deriveTypeFromForm(context.newRecord);
                 return;
             }
+
+            log.audit({
+                title: wiConfig.LOG_PREFIX + 'PREFILL_PATH',
+                details: 'Path 1: raised through the picker with config id ' + configId + '. ' +
+                    'Full prefill applied.'
+            });
 
             var sourceType = parameters[wiConfig.URL_PARAMS.SOURCE_TYPE] || '';
             var sourceId = parameters[wiConfig.URL_PARAMS.SOURCE_ID] || '';
@@ -255,9 +325,71 @@ define(['N/search', 'N/log', './lib/wi_lib_config'], function (search, log, wiCo
         }
     }
 
+
+    /**
+     * Records changes to the work instruction type. VISIBILITY, NOT ENFORCEMENT.
+     *
+     * The field is Inline Text on the Task forms, so a user cannot edit it there. Any change
+     * therefore arrives by inline edit from a list, by CSV update, or from another script — and
+     * Steve needs to SEE those rather than have them prevented. Blocking the change would turn a
+     * visible, investigable event into a support ticket about a Task that will not save.
+     *
+     * Only a change away from an existing value is logged. Filling in a blank is the safety net
+     * doing its job, not an event worth reporting.
+     *
+     * @param {Object} context
+     * @param {Object} context.newRecord
+     * @param {Object} context.oldRecord
+     * @param {string} context.type
+     * @returns {void}
+     */
+    function beforeSubmit(context) {
+        try {
+            if (context.type !== context.UserEventType.EDIT &&
+                context.type !== context.UserEventType.XEDIT) {
+                return;
+            }
+
+            if (!context.oldRecord || !context.newRecord) {
+                return;
+            }
+
+            var field = wiConfig.TASK_FIELDS.WORK_INSTRUCTION_TYPE;
+            var oldValue = context.oldRecord.getValue({ fieldId: field });
+            var newValue = context.newRecord.getValue({ fieldId: field });
+
+            // Blank -> populated is the safety net working. Not an event.
+            if (!oldValue) {
+                return;
+            }
+
+            if (String(oldValue) === String(newValue)) {
+                return;
+            }
+
+            var user = runtime.getCurrentUser();
+
+            log.audit({
+                title: wiConfig.LOG_PREFIX + 'TYPE_CHANGED',
+                details: 'Task id ' + context.newRecord.id + ': work instruction type changed ' +
+                    'from ' + JSON.stringify(oldValue) + ' to ' + JSON.stringify(newValue) +
+                    ' by ' + (user ? user.name + ' (id ' + user.id + ')' : 'an unknown user') +
+                    '. The change was NOT blocked.'
+            });
+
+        } catch (e) {
+            // Logging must never stop a Task saving.
+            log.error({
+                title: wiConfig.LOG_PREFIX + 'TYPE_CHANGE_LOG_FAILED',
+                details: (e.name || '') + ': ' + (e.message || e)
+            });
+        }
+    }
+
     return {
         VERSION: VERSION,
-        beforeLoad: beforeLoad
+        beforeLoad: beforeLoad,
+        beforeSubmit: beforeSubmit
     };
 
 });
