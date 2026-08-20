@@ -218,6 +218,17 @@ through the pre-creation path instead.
   Anything the handler needs — here the resolved Suitelet URL — travels in a hidden form field,
   not in the button wiring.
 
+- **Popup and tab behaviour is deliberate, and each rule exists for a reason:**
+  - **The popup closes only when `window.opener` exists.** The picker can legitimately be opened
+    directly by URL, and is opened that way whenever a popup was blocked. In those cases it is an
+    ordinary tab, and closing it would shut the user's own tab under them.
+  - **The Task is opened before the popup is closed**, never after. Closing the window first can
+    cancel the pending navigation in some browsers.
+  - **A blocked popup degrades to in-place navigation**, which is the pre-1.1.0 behaviour. A
+    blocked popup must degrade to the old experience, never to a dead button.
+  - **The Task opens at full tab width, not inside the popup.** A NetSuite Task form in a 520px
+    window is unusable. The picker is a chooser, not a workspace.
+
 - **`log.warn()` does not exist in SuiteScript.** Use `log.debug()`. Calling `log.warn()` throws.
 - **`search.lookupFields()` fails on computed fields.** Use `record.load().getValue()` for
   anything derived, formula-based or summary.
@@ -244,6 +255,12 @@ they were observed on.
 Every `log.audit` and `log.error` title begins `WI_`, so the execution log can be filtered on one
 string.
 
+> **Not every key reaches the Script Execution Log.** `wi_cs_source_button.js` is attached via
+> `clientScriptModulePath` and therefore has **no script record and no deployment**, so it has
+> nothing to log against. Its `N/log` output goes to the **browser console only** — the keys marked
+> *console* below will never appear in the Script Execution Log, no matter how long you search for
+> them. Keep the browser console open when testing anything client-side.
+
 | Key | Meaning | What to do if it fires |
 |---|---|---|
 | `WI_TASK_CREATED` | **Reserved — no script raises this.** A Task is created when the user saves the form, which nothing in this feature observes. Kept only so that a future session grepping for it finds this note rather than hunting for a missing logger. | Nothing. |
@@ -252,8 +269,9 @@ string.
 | `WI_PICKER_FAILED` | The picker Suitelet could not build its list. The user saw an apology, not an empty list. | Read the logged error. The picker never falls through to a default form. |
 | `WI_PREFILL_FAILED` | The Task prefill threw. The Task form still opened, unpopulated or partly populated. | Read the logged parameters. The user can complete the Task by hand meanwhile. |
 | `WI_BUTTON_FAILED` | The button could not be drawn on an Opportunity or Customer. The record still opened. | Read the logged error. Users cannot raise work instructions from that record until fixed. |
-| `WI_BUTTON_URL_MISSING` | The button was clicked but the hidden picker URL field was empty. The user saw an apology rather than a blank page. | The user event drew the button but not the field. Check `beforeLoad` completed — a `WI_BUTTON_FAILED` entry usually precedes this. |
-| `WI_BUTTON_CLICK_FAILED` | The client-side button handler threw. | Read the logged error and the browser console. |
+| `WI_BUTTON_URL_MISSING` | **Console only.** The button was clicked but the hidden picker URL field was empty. The user saw an apology rather than a blank page. | The user event drew the button but not the field. Check `beforeLoad` completed — a `WI_BUTTON_FAILED` entry in the Script Execution Log usually precedes this. |
+| `WI_BUTTON_CLICK_FAILED` | **Console only.** The client-side button handler threw. | Read the browser console. |
+| `WI_POPUP_BLOCKED` | **Console only.** The browser blocked the picker popup, so it opened in place instead. Not a fault — the feature still works, but the user is navigated away from the source record. | Nothing required. If users hit it often, have them allow popups for the NetSuite domain. |
 | `WI_CONFIG_MISSING` | A Work Instruction Type record could not be read, or a required field on it was empty. | Check the configuration record exists in this account and is fully populated. See section 10. |
 | `WI_ROUTE_FAILED` | The work instruction could not be routed — form, assignee or due date could not be resolved. | Read the logged raw values. Usually a configuration gap rather than a code fault. |
 | `WI_PRIORITY_UNMAPPED` | The raw value of `custrecord_wi_default_priority` did not map to `HIGH`, `MEDIUM` or `LOW`. Priority was left unset — deliberately, not silently. | Read the logged raw value. Either the config record holds an unexpected option, or the normalisation rule is wrong. See section 4. |
@@ -304,11 +322,22 @@ versions, and greps for forbidden patterns.
 
 Grep the execution log for `WI_` after every scenario.
 
+> **Keep the browser console open for every client-side test.** `wi_cs_source_button.js` and the
+> picker's injected click handler log to the console and nowhere else — see the note in section 7.
+> A client-side failure searched for only in the Script Execution Log will look like silence.
+
 | # | Scenario | Expected |
 |---|---|---|
 | 1 | Open an **Opportunity** in view mode | "Create Work Instruction" button present |
-| 1a | **Click the button with the browser console open** | Navigates to the picker. **No `TypeError`.** This is the regression that produced the error quoted in section 5 |
+| 1a | **Click the button with the browser console open** | Picker opens **in a popup**. **No `TypeError`.** This is the regression that produced the error quoted in section 5 |
 | 1b | Inspect the page source for the hidden URL field | Present and populated. If empty, the client script alerts rather than navigating to nowhere — see `WI_BUTTON_URL_MISSING` |
+| 1c | After the popup opens, look at the **original tab** | The Opportunity is **still loaded and untouched** |
+| 1d | Click a work instruction in the popup | Task opens in a **full new tab**, popup **closes**, Opportunity tab still untouched |
+| 1e | Save the Task, close its tab | Back on the Opportunity, unchanged. Nothing to navigate back through |
+| 1f | Click the button **twice** | The existing popup is **reused and focused**, not duplicated |
+| 1g | **Block popups** in the browser, then click the button | Picker opens **in place** — the pre-1.1.0 behaviour. Feature still works. `WI_POPUP_BLOCKED` in the console |
+| 1h | Open the picker URL **directly in a tab**, click a work instruction | Task opens in a new tab and the picker tab is **NOT closed**. This is the `window.opener` guard |
+| 1i | Repeat 1a–1e from a **Customer** record | Same behaviour throughout |
 | 2 | Open an Opportunity in **edit** and **create** mode | **No** button — view only |
 | 3 | Open a **Customer** in view mode | Button present |
 | 4 | Click the button from an Opportunity | Picker lists active types, sorted by name, one link each |

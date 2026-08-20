@@ -29,14 +29,28 @@
  * @NApiVersion 2.1
  * @NScriptType ClientScript
  * @NModuleScope SameAccount
- * @version 1.0.0
+ * @version 1.1.0
  */
 define(['N/currentRecord', 'N/log', './lib/wi_lib_config'],
     function (currentRecord, log, wiConfig) {
 
         'use strict';
 
-        var VERSION = '1.0.0';
+        var VERSION = '1.1.0';
+
+        /**
+         * Naming the window means a second click REUSES and focuses the existing popup rather than
+         * stacking a second one on top of it.
+         * @type {string}
+         */
+        var POPUP_NAME = 'wiWorkInstructionPicker';
+
+        /**
+         * Big enough to read a list of work instruction names, small enough to read as a chooser
+         * rather than a workspace. The Task itself opens at full tab width — see the picker.
+         * @type {string}
+         */
+        var POPUP_FEATURES = 'width=520,height=640,resizable=yes,scrollbars=yes';
 
         /**
          * Required entry point. NetSuite will not load a client script without one. Nothing to do
@@ -49,7 +63,12 @@ define(['N/currentRecord', 'N/log', './lib/wi_lib_config'],
         }
 
         /**
-         * Navigates to the picker Suitelet.
+         * Opens the picker Suitelet in a small popup window, leaving the source record loaded in
+         * the current tab. The user never navigates away from the record they are working in.
+         *
+         * If the popup is blocked, window.open returns null and this falls back to navigating in
+         * place — the behaviour before this version. A blocked popup degrades to the old
+         * experience, never to a dead button.
          *
          * NetSuite calls this by name, with no arguments — it appends '()' itself. The URL was
          * resolved server-side by url.resolveScript() and placed in a hidden field, so nothing
@@ -75,7 +94,23 @@ define(['N/currentRecord', 'N/log', './lib/wi_lib_config'],
                     return;
                 }
 
-                window.location.href = target;
+                var popup = window.open(target, POPUP_NAME, POPUP_FEATURES);
+
+                if (!popup) {
+                    // Popup blocker. Fall back to the previous behaviour rather than failing.
+                    // This log goes to the BROWSER CONSOLE, not the Script Execution Log — this
+                    // script has no script record. See docs/context.md section 7.
+                    log.error({
+                        title: wiConfig.LOG_PREFIX + 'POPUP_BLOCKED',
+                        details: 'window.open returned null, so the picker was opened in place ' +
+                            'instead. The feature still works; the source record is navigated ' +
+                            'away from.'
+                    });
+                    window.location.href = target;
+                    return;
+                }
+
+                popup.focus();
 
             } catch (e) {
                 log.error({

@@ -10,6 +10,10 @@
  *
  * GET only. There is no submit step: one click is the entire interaction.
  *
+ * The picker normally runs inside a small popup opened by wi_cs_source_button.js. Clicking a work
+ * instruction opens the Task in a FULL NEW TAB and then closes the popup, in that order, leaving
+ * the source record untouched in the original tab.
+ *
  * This Suitelet must be deployed with Available Without Login: No.
  *
  * House style is ES5 throughout — var, function, 'use strict'. Deliberate. Do not modernise.
@@ -17,16 +21,24 @@
  * @NApiVersion 2.1
  * @NScriptType Suitelet
  * @NModuleScope SameAccount
- * @version 1.0.0
+ * @version 1.1.0
  */
 define(['N/ui/serverWidget', 'N/url', 'N/log', './lib/wi_lib_config'],
     function (serverWidget, url, log, wiConfig) {
 
         'use strict';
 
-        var VERSION = '1.0.0';
+        var VERSION = '1.1.0';
 
         var PAGE_TITLE = 'Create Work Instruction';
+
+        /**
+         * Hook for the click handler injected below. Anchors carry a real href and target="_blank"
+         * as well, so if the injected script does not run the Task still opens in a new tab — only
+         * the popup-closing is lost.
+         * @type {string}
+         */
+        var LINK_CLASS = 'wi-instruction-link';
 
         /**
          * Escapes a value for inclusion in HTML text or an attribute.
@@ -101,6 +113,54 @@ define(['N/ui/serverWidget', 'N/url', 'N/log', './lib/wi_lib_config'],
         }
 
         /**
+         * Client-side click handler, injected into the rendered page.
+         *
+         * Two things happen on a click, IN THIS ORDER:
+         *
+         *   1. the Task opens in a new browser tab
+         *   2. the popup closes
+         *
+         * The order matters: closing the window first can cancel the pending navigation in some
+         * browsers.
+         *
+         * Two guards:
+         *
+         *   - The window is closed ONLY when window.opener exists. The picker can legitimately be
+         *     reached directly by URL, and is reached that way whenever a popup was blocked. In
+         *     those cases it is an ordinary tab, and closing it would shut the user's tab under
+         *     them.
+         *   - If window.open is blocked, the click navigates in place instead of doing nothing.
+         *
+         * If this script does not run at all, the anchors still carry href and target="_blank", so
+         * the Task opens in a new tab regardless — only the popup-closing is lost.
+         *
+         * @returns {string}
+         */
+        function clickHandlerScript() {
+            return '<script type="text/javascript">' +
+                '(function () {' +
+                '    "use strict";' +
+                '    var links = document.querySelectorAll("a.' + LINK_CLASS + '");' +
+                '    var i;' +
+                '    function onLinkClick(e) {' +
+                '        var href = this.href;' +
+                '        if (e && e.preventDefault) { e.preventDefault(); }' +
+                '        var opened = window.open(href, "_blank");' +
+                '        if (!opened) {' +
+                '            window.location.href = href;' +
+                '            return false;' +
+                '        }' +
+                '        if (window.opener) { window.close(); }' +
+                '        return false;' +
+                '    }' +
+                '    for (i = 0; i < links.length; i += 1) {' +
+                '        links[i].addEventListener("click", onLinkClick, false);' +
+                '    }' +
+                '}());' +
+                '<' + '/script>';
+        }
+
+        /**
          * @param {Array<Object>} types
          * @param {string} sourceType
          * @param {string} sourceId
@@ -115,13 +175,15 @@ define(['N/ui/serverWidget', 'N/url', 'N/log', './lib/wi_lib_config'],
             for (i = 0; i < types.length; i += 1) {
                 html.push(
                     '<li style="margin:0 0 8px 0;">' +
-                    '<a href="' + escapeHtml(buildTaskUrl(types[i], sourceType, sourceId)) + '">' +
+                    '<a class="' + LINK_CLASS + '" target="_blank" href="' +
+                    escapeHtml(buildTaskUrl(types[i], sourceType, sourceId)) + '">' +
                     escapeHtml(types[i].name) +
                     '</a></li>'
                 );
             }
 
             html.push('</ul></div>');
+            html.push(clickHandlerScript());
             return html.join('');
         }
 
