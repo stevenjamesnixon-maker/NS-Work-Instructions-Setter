@@ -14,11 +14,14 @@
  * The work instruction type is therefore recovered from the form — see deriveTypeFromForm below.
  * Only the type is recovered; nothing else on such a Task is touched.
  *
- * The work instruction on an already-saved Task is corrected in beforeLoad, on the EDIT page
- * load, so the user SEES the new type, assignee, priority and due date before they save — see
- * rederiveTypeOnEditLoad. beforeSubmit keeps a narrower version of the same correction as a
- * backstop for form changes that never render a page. The two are deliberately asymmetric; the
- * banner comment above rederiveTypeOnEditLoad explains why, and it is not an oversight to tidy.
+ * The work instruction on an already-saved Task is corrected by wi_cs_task_form.js, a CLIENT
+ * SCRIPT attached below via clientScriptModulePath. It cannot be done here: NetSuite ignores
+ * writes to a record that beforeLoad has loaded. See the banner before beforeLoad — that mistake
+ * has already been made once and shipped to Sandbox.
+ *
+ * beforeSubmit keeps a narrower version of the same correction as a backstop for form changes
+ * that never render a page. It and the client script are deliberately asymmetric; the banner
+ * above rederiveTypeOnFormChange explains why, and it is not an oversight to tidy.
  *
  * beforeSubmit does three things, split by event type. On CREATE it is the save-time safety net
  * (path 3). On EDIT it re-derives the TYPE ONLY when the CUSTOM FORM has changed — see
@@ -30,14 +33,14 @@
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  * @NModuleScope SameAccount
- * @version 1.4.0
+ * @version 1.5.0
  */
 define(['N/search', 'N/runtime', 'N/log', './lib/wi_lib_config'],
     function (search, runtime, log, wiConfig) {
 
     'use strict';
 
-    var VERSION = '1.4.0';
+    var VERSION = '1.5.0';
 
     /**
      * Reads a value from a search.lookupFields result. Select fields come back as an array of
@@ -361,148 +364,75 @@ define(['N/search', 'N/runtime', 'N/log', './lib/wi_lib_config'],
     }
 
     /* -------------------------------------------------------------------------------------- */
-    /* RE-DERIVING THE WORK INSTRUCTION ON AN ALREADY-SAVED TASK                                */
+    /* WHY THERE IS NO EDIT BRANCH IN beforeLoad — READ THIS BEFORE ADDING ONE                  */
     /*                                                                                          */
-    /* There are TWO sites, and they deliberately do DIFFERENT amounts of work. This is not an   */
-    /* inconsistency waiting to be tidied up — the difference is the whole point, and either     */
-    /* half made to match the other would be a defect:                                           */
+    /* 1.4.0 put the edit-time re-derivation here, in beforeLoad, on EDIT. It DOES NOT WORK,     */
+    /* and it does not fail in any way you can see. NetSuite's documentation:                    */
     /*                                                                                          */
-    /*   rederiveTypeOnEditLoad   beforeLoad, EDIT. Re-derives the type AND the assignee,        */
-    /*                            priority and due date. The user is looking at the page. Every  */
-    /*                            changed value is in front of them, before they save, and they  */
-    /*                            can adjust anything they disagree with or hit Cancel.          */
+    /*   "You can't update a record that's loaded in a beforeLoad script — if you try, that      */
+    /*    logic is ignored."                                                                     */
     /*                                                                                          */
-    /*   rederiveTypeOnFormChange beforeSubmit, EDIT. Re-derives the TYPE and nothing else. This */
-    /*                            path catches a form change arriving from a script, a CSV       */
-    /*                            update or an integration — where there is NO page, NO review   */
-    /*                            step and nobody watching. Silently moving somebody's work to   */
-    /*                            another person from a path with no review is a different and   */
-    /*                            worse thing than doing it on a page they are looking at.       */
+    /*   https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/section_4407991781.html   */
     /*                                                                                          */
-    /* The rule: generous where the user can see and correct it, conservative where nobody is    */
-    /* watching. DO NOT add applyConfigValues to the beforeSubmit site to "make them consistent" */
-    /* and do not strip it from the beforeLoad site.                                             */
+    /* That is why paths 1 and 2 work and an EDIT branch cannot. On CREATE the record is still   */
+    /* being BUILT, so setValue takes effect and the page renders what was written. On EDIT the  */
+    /* record has been LOADED from the database, and every write to newRecord is discarded —     */
+    /* silently. No error, no log line, nothing in the execution log. The code runs, decides      */
+    /* correctly, writes the value, logs that it wrote the value, and NetSuite throws it away.   */
+    /* It cost a full Sandbox round to find, because everything except the screen said it worked. */
+    /*                                                                                          */
+    /* The supported mechanism, named in the same documentation, is a CLIENT SCRIPT pageInit.    */
+    /* That is wi_cs_task_form.js, attached below via clientScriptModulePath. Any change to what */
+    /* an edit-time re-derivation does belongs THERE, not here.                                  */
+    /*                                                                                          */
+    /* beforeSubmit keeps its own re-derivation. That one works, because beforeSubmit writes to  */
+    /* a record on its way to the database rather than one on its way to a page. It stays the    */
+    /* backstop for form changes that never render a page at all — a script, a CSV update, an    */
+    /* integration. See the banner above rederiveTypeOnFormChange.                               */
     /* -------------------------------------------------------------------------------------- */
 
+
     /**
-     * Re-derives the work instruction on the EDIT PAGE LOAD, so the correction is visible.
+     * Attaches wi_cs_task_form.js to the Task edit page.
      *
-     * WHY THIS RUNS AT LOAD AND NOT ONLY AT SAVE. Correcting the type at save time is invisible
-     * to the person doing the work: they switch the form, the page reloads on the new form, and
-     * the work instruction type still shows the old value while they fill in the new form's
-     * fields. Nothing tells them it is about to change. From their side the record simply looks
-     * wrong. It has to update the moment the form switches, exactly as it does on create.
+     * A module PATH, not a file internal id. Paths are stable across environments;
+     * clientScriptFileId would not be. Relative to this script's folder, so both files must sit
+     * in the same File Cabinet folder — see docs/context.md section 8.
      *
-     * THERE IS NO oldRecord IN beforeLoad, so the guard is not "has the form changed" — it is
-     * "does the TYPE DISAGREE WITH THE FORM", which is the condition that actually matters and
-     * is true in exactly the same situations. Two cheap exits come first and between them absorb
-     * every ordinary edit in the account:
+     * The client script has no script record and no deployment. A File Cabinet upload is the
+     * whole of its installation, exactly as for wi_cs_source_button.js.
      *
-     *   form maps to nothing, or ambiguously -> nothing written, debug log. Most Tasks.
-     *   type already agrees with the form    -> nothing written, NOTHING LOGGED. Every ordinary
-     *                                          edit of a correctly classified Task.
+     * WRAPPED SEPARATELY so that a failure to attach cannot stop the Task page rendering. A Task
+     * that opens without the re-derivation is the pre-1.5.0 behaviour and is survivable; a Task
+     * form that will not open is not.
      *
-     * WHAT CHANGES WHEN THE TYPE DISAGREES depends on what the type was:
-     *
-     *   POPULATED and different — a genuine reclassification. The type, ASSIGNEE, PRIORITY and
-     *     DUE DATE are all re-derived from the new configuration. The assignee follows the work
-     *     instruction because a Task whose work instruction changed but whose assignee did not is
-     *     sitting on the WRONG TEAM'S LIST, which is the failure this whole feature exists to
-     *     prevent. It is also the rule that can be explained to a user in one sentence.
-     *
-     *     CONSEQUENCE, ACCEPTED DELIBERATELY: this moves a Task away from somebody who may have
-     *     already claimed it, without warning them. WI_TYPE_REDERIVED records the assignee before
-     *     and after, so it is traceable. The user making the change sees the new assignee on the
-     *     page before saving; the person losing the Task does not.
-     *
-     *   EMPTY — a Task that predates the feature. THE TYPE ONLY. Its assignee was set by a person
-     *     for a reason, and filling in a missing classification is no reason to pull the work out
-     *     from under them. Same logic as path 3.
-     *
-     * The DUE DATE is recalculated as today plus the new offset, not from the original creation
-     * date, so a reclassified Task's deadline shifts. Accepted; recorded in docs/context.md
-     * section 6.
-     *
-     * THE TITLE IS NEVER RE-DERIVED, here or anywhere. It is authored, not derived.
-     *
-     * @param {Object} newRecord
+     * @param {Object} form - context.form
      * @returns {void}
      */
-    function rederiveTypeOnEditLoad(newRecord) {
-        var fields = wiConfig.TASK_NATIVE_FIELDS;
+    function attachTaskFormClientScript(form) {
+        try {
+            if (!form) {
+                return;
+            }
 
-        var formId = newRecord.getValue({ fieldId: fields.CUSTOM_FORM });
-        var existingType = newRecord.getValue({
-            fieldId: wiConfig.TASK_FIELDS.WORK_INSTRUCTION_TYPE
-        });
+            form.clientScriptModulePath = './wi_cs_task_form.js';
 
-        var config = wiConfig.getByFormId(formId);
-
-        if (config === null) {
-            // Unmapped or ambiguous. Nothing is written — in particular the existing type is
-            // NOT cleared, for the same reason as everywhere else in this file: clearing a real
-            // value on the strength of a configuration gap destroys data. Debug, not error, for
-            // the usual volume reason. An ambiguous mapping has already logged WI_FORM_AMBIGUOUS.
-            log.debug({
-                title: wiConfig.LOG_PREFIX + 'FORM_UNMAPPED',
-                details: 'Edit page load for Task id ' + newRecord.id + ': form internal id ' +
-                    JSON.stringify(formId) + ' maps to no single active configuration record. ' +
-                    'Nothing was changed.'
+        } catch (e) {
+            log.error({
+                title: wiConfig.LOG_PREFIX + 'CLIENT_SCRIPT_ATTACH_FAILED',
+                details: 'Could not attach wi_cs_task_form.js to the Task edit form. The page ' +
+                    'still opened, but switching the custom form will NOT re-derive the work ' +
+                    'instruction — the save-time backstop in beforeSubmit is all that remains. ' +
+                    'Check the file is in the same File Cabinet folder as this script. ' +
+                    (e.name || '') + ': ' + (e.message || e)
             });
-            return;
         }
-
-        if (sameId(existingType, config.id)) {
-            // The type already agrees with the form. Every ordinary edit of a correctly
-            // classified Task lands here: nothing is written and nothing is logged, because
-            // "this Task is still what it always was" is not an event.
-            return;
-        }
-
-        // Empty is NOT the same as different. An empty type is a Task that predates the feature;
-        // a populated one that disagrees is a reclassification. They get different treatment.
-        var isReclassification = !!existingType;
-        var previousAssignee = newRecord.getValue({ fieldId: fields.ASSIGNED });
-
-        newRecord.setValue({
-            fieldId: wiConfig.TASK_FIELDS.WORK_INSTRUCTION_TYPE,
-            value: config.id
-        });
-
-        if (isReclassification) {
-            // force = true: the assignee, priority and due date on this Task were derived from
-            // the PREVIOUS configuration and are stale the moment the type moves. See the
-            // reasoning in the docblock — the assignee follows the work instruction.
-            //
-            // Note what force cannot do: if the new configuration has no default assignee and
-            // there is no source record to fall back on, chooseAssignee returns null and the
-            // existing assignee STAYS. That is correct. There is nothing to follow the work
-            // instruction to, and clearing the field would leave the Task on nobody's list.
-            applyConfigValues(
-                newRecord, config, emptySource(), true, 'Edit page load (reclassification)'
-            );
-        }
-
-        log.audit({
-            title: wiConfig.LOG_PREFIX + 'TYPE_REDERIVED',
-            details: 'Edit page load for Task id ' + newRecord.id + ': form internal id ' +
-                JSON.stringify(formId) + ' maps to "' + config.name + '" (id ' + config.id +
-                '), so the work instruction type was re-derived from ' +
-                JSON.stringify(existingType) + ' to ' + JSON.stringify(config.id) + '. ' +
-                (isReclassification
-                    ? 'Reclassification: assignee, priority and due date were re-derived too. ' +
-                      'Assignee was ' + JSON.stringify(previousAssignee) + ' before this load ' +
-                      'and ' + JSON.stringify(newRecord.getValue({ fieldId: fields.ASSIGNED })) +
-                      ' after it.'
-                    : 'The type was empty, so ONLY the type was set — the assignee, priority ' +
-                      'and due date were left exactly as they were.') +
-                ' The title was not touched. Nothing is saved until the user saves the record.'
-        });
     }
 
     /**
      * @param {Object} context
      * @param {Object} context.newRecord
+     * @param {Object} context.form
      * @param {Object} context.request
      * @param {string} context.type
      * @returns {void}
@@ -511,11 +441,10 @@ define(['N/search', 'N/runtime', 'N/log', './lib/wi_lib_config'],
         var parameters = null;
 
         try {
-            // EDIT gets its own job: correct a type that disagrees with the form, visibly,
-            // before the user saves. No request object is needed or read — this is driven
-            // entirely by what is already on the record.
+            // On EDIT the only thing this script can usefully do is ATTACH the client script
+            // that does the work. It must not write to newRecord here — see the banner above.
             if (context.type === context.UserEventType.EDIT) {
-                rederiveTypeOnEditLoad(context.newRecord);
+                attachTaskFormClientScript(context.form);
                 return;
             }
 
