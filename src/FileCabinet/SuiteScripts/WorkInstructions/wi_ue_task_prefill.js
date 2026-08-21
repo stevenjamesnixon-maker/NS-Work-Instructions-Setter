@@ -14,24 +14,30 @@
  * The work instruction type is therefore recovered from the form — see deriveTypeFromForm below.
  * Only the type is recovered; nothing else on such a Task is touched.
  *
+ * The work instruction on an already-saved Task is corrected in beforeLoad, on the EDIT page
+ * load, so the user SEES the new type, assignee, priority and due date before they save — see
+ * rederiveTypeOnEditLoad. beforeSubmit keeps a narrower version of the same correction as a
+ * backstop for form changes that never render a page. The two are deliberately asymmetric; the
+ * banner comment above rederiveTypeOnEditLoad explains why, and it is not an oversight to tidy.
+ *
  * beforeSubmit does three things, split by event type. On CREATE it is the save-time safety net
- * (path 3). On EDIT it re-derives the type when the CUSTOM FORM has changed on an already-saved
- * Task — see rederiveTypeOnFormChange. On EDIT and XEDIT alike it logs a change to the work
- * instruction type that this script did not make. It never blocks a save.
+ * (path 3). On EDIT it re-derives the TYPE ONLY when the CUSTOM FORM has changed — see
+ * rederiveTypeOnFormChange. On EDIT and XEDIT alike it logs a change to the work instruction type
+ * that this script did not make. It never blocks a save.
  *
  * House style is ES5 throughout — var, function, 'use strict'. Deliberate. Do not modernise.
  *
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  * @NModuleScope SameAccount
- * @version 1.3.0
+ * @version 1.4.0
  */
 define(['N/search', 'N/runtime', 'N/log', './lib/wi_lib_config'],
     function (search, runtime, log, wiConfig) {
 
     'use strict';
 
-    var VERSION = '1.3.0';
+    var VERSION = '1.4.0';
 
     /**
      * Reads a value from a search.lookupFields result. Select fields come back as an array of
@@ -354,6 +360,146 @@ define(['N/search', 'N/runtime', 'N/log', './lib/wi_lib_config'],
         });
     }
 
+    /* -------------------------------------------------------------------------------------- */
+    /* RE-DERIVING THE WORK INSTRUCTION ON AN ALREADY-SAVED TASK                                */
+    /*                                                                                          */
+    /* There are TWO sites, and they deliberately do DIFFERENT amounts of work. This is not an   */
+    /* inconsistency waiting to be tidied up — the difference is the whole point, and either     */
+    /* half made to match the other would be a defect:                                           */
+    /*                                                                                          */
+    /*   rederiveTypeOnEditLoad   beforeLoad, EDIT. Re-derives the type AND the assignee,        */
+    /*                            priority and due date. The user is looking at the page. Every  */
+    /*                            changed value is in front of them, before they save, and they  */
+    /*                            can adjust anything they disagree with or hit Cancel.          */
+    /*                                                                                          */
+    /*   rederiveTypeOnFormChange beforeSubmit, EDIT. Re-derives the TYPE and nothing else. This */
+    /*                            path catches a form change arriving from a script, a CSV       */
+    /*                            update or an integration — where there is NO page, NO review   */
+    /*                            step and nobody watching. Silently moving somebody's work to   */
+    /*                            another person from a path with no review is a different and   */
+    /*                            worse thing than doing it on a page they are looking at.       */
+    /*                                                                                          */
+    /* The rule: generous where the user can see and correct it, conservative where nobody is    */
+    /* watching. DO NOT add applyConfigValues to the beforeSubmit site to "make them consistent" */
+    /* and do not strip it from the beforeLoad site.                                             */
+    /* -------------------------------------------------------------------------------------- */
+
+    /**
+     * Re-derives the work instruction on the EDIT PAGE LOAD, so the correction is visible.
+     *
+     * WHY THIS RUNS AT LOAD AND NOT ONLY AT SAVE. Correcting the type at save time is invisible
+     * to the person doing the work: they switch the form, the page reloads on the new form, and
+     * the work instruction type still shows the old value while they fill in the new form's
+     * fields. Nothing tells them it is about to change. From their side the record simply looks
+     * wrong. It has to update the moment the form switches, exactly as it does on create.
+     *
+     * THERE IS NO oldRecord IN beforeLoad, so the guard is not "has the form changed" — it is
+     * "does the TYPE DISAGREE WITH THE FORM", which is the condition that actually matters and
+     * is true in exactly the same situations. Two cheap exits come first and between them absorb
+     * every ordinary edit in the account:
+     *
+     *   form maps to nothing, or ambiguously -> nothing written, debug log. Most Tasks.
+     *   type already agrees with the form    -> nothing written, NOTHING LOGGED. Every ordinary
+     *                                          edit of a correctly classified Task.
+     *
+     * WHAT CHANGES WHEN THE TYPE DISAGREES depends on what the type was:
+     *
+     *   POPULATED and different — a genuine reclassification. The type, ASSIGNEE, PRIORITY and
+     *     DUE DATE are all re-derived from the new configuration. The assignee follows the work
+     *     instruction because a Task whose work instruction changed but whose assignee did not is
+     *     sitting on the WRONG TEAM'S LIST, which is the failure this whole feature exists to
+     *     prevent. It is also the rule that can be explained to a user in one sentence.
+     *
+     *     CONSEQUENCE, ACCEPTED DELIBERATELY: this moves a Task away from somebody who may have
+     *     already claimed it, without warning them. WI_TYPE_REDERIVED records the assignee before
+     *     and after, so it is traceable. The user making the change sees the new assignee on the
+     *     page before saving; the person losing the Task does not.
+     *
+     *   EMPTY — a Task that predates the feature. THE TYPE ONLY. Its assignee was set by a person
+     *     for a reason, and filling in a missing classification is no reason to pull the work out
+     *     from under them. Same logic as path 3.
+     *
+     * The DUE DATE is recalculated as today plus the new offset, not from the original creation
+     * date, so a reclassified Task's deadline shifts. Accepted; recorded in docs/context.md
+     * section 6.
+     *
+     * THE TITLE IS NEVER RE-DERIVED, here or anywhere. It is authored, not derived.
+     *
+     * @param {Object} newRecord
+     * @returns {void}
+     */
+    function rederiveTypeOnEditLoad(newRecord) {
+        var fields = wiConfig.TASK_NATIVE_FIELDS;
+
+        var formId = newRecord.getValue({ fieldId: fields.CUSTOM_FORM });
+        var existingType = newRecord.getValue({
+            fieldId: wiConfig.TASK_FIELDS.WORK_INSTRUCTION_TYPE
+        });
+
+        var config = wiConfig.getByFormId(formId);
+
+        if (config === null) {
+            // Unmapped or ambiguous. Nothing is written — in particular the existing type is
+            // NOT cleared, for the same reason as everywhere else in this file: clearing a real
+            // value on the strength of a configuration gap destroys data. Debug, not error, for
+            // the usual volume reason. An ambiguous mapping has already logged WI_FORM_AMBIGUOUS.
+            log.debug({
+                title: wiConfig.LOG_PREFIX + 'FORM_UNMAPPED',
+                details: 'Edit page load for Task id ' + newRecord.id + ': form internal id ' +
+                    JSON.stringify(formId) + ' maps to no single active configuration record. ' +
+                    'Nothing was changed.'
+            });
+            return;
+        }
+
+        if (sameId(existingType, config.id)) {
+            // The type already agrees with the form. Every ordinary edit of a correctly
+            // classified Task lands here: nothing is written and nothing is logged, because
+            // "this Task is still what it always was" is not an event.
+            return;
+        }
+
+        // Empty is NOT the same as different. An empty type is a Task that predates the feature;
+        // a populated one that disagrees is a reclassification. They get different treatment.
+        var isReclassification = !!existingType;
+        var previousAssignee = newRecord.getValue({ fieldId: fields.ASSIGNED });
+
+        newRecord.setValue({
+            fieldId: wiConfig.TASK_FIELDS.WORK_INSTRUCTION_TYPE,
+            value: config.id
+        });
+
+        if (isReclassification) {
+            // force = true: the assignee, priority and due date on this Task were derived from
+            // the PREVIOUS configuration and are stale the moment the type moves. See the
+            // reasoning in the docblock — the assignee follows the work instruction.
+            //
+            // Note what force cannot do: if the new configuration has no default assignee and
+            // there is no source record to fall back on, chooseAssignee returns null and the
+            // existing assignee STAYS. That is correct. There is nothing to follow the work
+            // instruction to, and clearing the field would leave the Task on nobody's list.
+            applyConfigValues(
+                newRecord, config, emptySource(), true, 'Edit page load (reclassification)'
+            );
+        }
+
+        log.audit({
+            title: wiConfig.LOG_PREFIX + 'TYPE_REDERIVED',
+            details: 'Edit page load for Task id ' + newRecord.id + ': form internal id ' +
+                JSON.stringify(formId) + ' maps to "' + config.name + '" (id ' + config.id +
+                '), so the work instruction type was re-derived from ' +
+                JSON.stringify(existingType) + ' to ' + JSON.stringify(config.id) + '. ' +
+                (isReclassification
+                    ? 'Reclassification: assignee, priority and due date were re-derived too. ' +
+                      'Assignee was ' + JSON.stringify(previousAssignee) + ' before this load ' +
+                      'and ' + JSON.stringify(newRecord.getValue({ fieldId: fields.ASSIGNED })) +
+                      ' after it.'
+                    : 'The type was empty, so ONLY the type was set — the assignee, priority ' +
+                      'and due date were left exactly as they were.') +
+                ' The title was not touched. Nothing is saved until the user saves the record.'
+        });
+    }
+
     /**
      * @param {Object} context
      * @param {Object} context.newRecord
@@ -365,8 +511,16 @@ define(['N/search', 'N/runtime', 'N/log', './lib/wi_lib_config'],
         var parameters = null;
 
         try {
-            // CREATE only. On view and edit the values are already on the record, and writing them
-            // again would overwrite whatever the user has since chosen.
+            // EDIT gets its own job: correct a type that disagrees with the form, visibly,
+            // before the user saves. No request object is needed or read — this is driven
+            // entirely by what is already on the record.
+            if (context.type === context.UserEventType.EDIT) {
+                rederiveTypeOnEditLoad(context.newRecord);
+                return;
+            }
+
+            // Everything below is CREATE only. On view the values are already on the record, and
+            // writing them again would overwrite whatever the user has since chosen.
             if (context.type !== context.UserEventType.CREATE) {
                 return;
             }
@@ -520,16 +674,25 @@ define(['N/search', 'N/runtime', 'N/log', './lib/wi_lib_config'],
      * without it this becomes a config search on every Task edit in the account, which is exactly
      * what save-time recovery was kept off EDIT to avoid (docs/context.md section 5).
      *
-     * ONLY THE TYPE IS RE-DERIVED. Not assignee, not due date, not priority. This Task is already
-     * saved, so the work may be under way and somebody may have deliberately reassigned it or
-     * pulled the due date forward. Changing the form corrects the CLASSIFICATION of the work; it
-     * must not reshuffle live work as a side effect. That is the difference between this and path
-     * 2, where the Task does not exist yet and nothing can be under way.
+     * ONLY THE TYPE IS RE-DERIVED HERE. Not assignee, not due date, not priority — and that is
+     * the deliberate asymmetry with rederiveTypeOnEditLoad described in the banner above. A form
+     * change that reaches THIS function never rendered a page: it came from a script, a CSV
+     * update or an integration, so there was no review step and nobody saw it. Reassigning
+     * somebody's work from a path with no review is a different and worse thing than doing it on
+     * a page the user is looking at. Conservative where nobody is watching. DO NOT add
+     * applyConfigValues here to make the two sites match.
+     *
+     * In the ordinary UI flow this function finds nothing to do, because beforeLoad already
+     * corrected the type when the page reloaded on the new form. It exists for the flows that
+     * have no beforeLoad at all.
      *
      * @param {Object} oldRecord
      * @param {Object} newRecord
      * @param {*} currentType - the type as it ARRIVED, read before anything here could write it
-     * @returns {void}
+     * @returns {Object|null} the configuration the CURRENT form maps to, when it was looked up
+     *                        here; null when no lookup happened (the form did not change) or the
+     *                        form maps to nothing. Handed to formExplainsType so that the same
+     *                        lookup is never paid for twice in one save.
      */
     function rederiveTypeOnFormChange(oldRecord, newRecord, currentType) {
         var formField = wiConfig.TASK_NATIVE_FIELDS.CUSTOM_FORM;
@@ -537,9 +700,10 @@ define(['N/search', 'N/runtime', 'N/log', './lib/wi_lib_config'],
         var oldForm = oldRecord.getValue({ fieldId: formField });
         var newForm = newRecord.getValue({ fieldId: formField });
 
-        // The guard described above. Almost every edit stops here.
+        // The guard described above. Almost every edit stops here, having looked nothing up —
+        // which is why the return value is null: there is no configuration to hand on.
         if (sameId(oldForm, newForm)) {
-            return;
+            return null;
         }
 
         var config = wiConfig.getByFormId(newForm);
@@ -557,13 +721,14 @@ define(['N/search', 'N/runtime', 'N/log', './lib/wi_lib_config'],
                     'to no single active configuration record. The existing work instruction ' +
                     'type was left in place.'
             });
-            return;
+            return null;
         }
 
-        // Two different forms can point at the same configuration record only if the config data
-        // says so, but the type is already right in that case and there is nothing to report.
+        // Already agrees with the new form — in the ordinary UI flow because beforeLoad set it
+        // when the page reloaded, and the user has seen it. Nothing to write and nothing to log
+        // a second time. The config is still returned: formExplainsType needs it.
         if (sameId(currentType, config.id)) {
-            return;
+            return config;
         }
 
         newRecord.setValue({
@@ -582,8 +747,53 @@ define(['N/search', 'N/runtime', 'N/log', './lib/wi_lib_config'],
                 JSON.stringify(oldForm) + ' to ' + JSON.stringify(newForm) + ', so the work ' +
                 'instruction type was re-derived from ' + JSON.stringify(currentType) + ' to "' +
                 config.name + '" (id ' + config.id + '). Assignee, due date and priority were ' +
-                'deliberately left alone — this Task may already be under way.'
+                'deliberately left alone — this change arrived without a page, so nobody ' +
+                'reviewed it. See the asymmetry banner in this file.'
         });
+
+        return config;
+    }
+
+    /**
+     * Does the work instruction type on this record agree with the form the record is on?
+     *
+     * THIS IS THE ONE QUESTION THAT SEPARATES THE TWO LOG KEYS, and getting it wrong destroys the
+     * signal `WI_TYPE_CHANGED` exists to give. Both re-derivation sites leave the same fingerprint
+     * behind — a type that changed during this save and now MATCHES the form. A person editing the
+     * field by hand leaves a different one: a type that changed to something the form does not
+     * account for. So the rule is not "did the type change" but:
+     *
+     *   WI_TYPE_CHANGED fires when the type changed to something THE FORM DOES NOT EXPLAIN.
+     *
+     * That is also the sharper signal in its own right. A Task whose type and form disagree is the
+     * data-quality event worth investigating; a type that agrees with its form is, by this
+     * feature's own definition, the right value however it got there.
+     *
+     * On XEDIT this returns false without searching: `customform` is not present on a sparse
+     * inline-edit record, so `getByFormId` is handed nothing and returns null. That is the correct
+     * answer there — an inline edit of the type field has no form change to justify it, and
+     * WI_TYPE_CHANGED should fire.
+     *
+     * @param {Object} newRecord
+     * @param {*} typeValue - the type to test, as it arrived
+     * @param {Object|null} knownConfig - the config for the current form if it has ALREADY been
+     *                                    looked up in this save; null to look it up here
+     * @returns {boolean}
+     */
+    function formExplainsType(newRecord, typeValue, knownConfig) {
+        var config = knownConfig;
+
+        if (config === null) {
+            config = wiConfig.getByFormId(newRecord.getValue({
+                fieldId: wiConfig.TASK_NATIVE_FIELDS.CUSTOM_FORM
+            }));
+        }
+
+        if (config === null) {
+            return false;
+        }
+
+        return sameId(typeValue, config.id);
     }
 
     /**
@@ -604,11 +814,22 @@ define(['N/search', 'N/runtime', 'N/log', './lib/wi_lib_config'],
      * Only a change away from an existing value is logged. Filling in a blank is the safety net
      * doing its job, not an event worth reporting.
      *
-     * THE TWO LOGGERS ARE KEPT DISJOINT BY READING THE INCOMING TYPE ONCE, BEFORE re-derivation
-     * can write to it. WI_TYPE_CHANGED is then decided entirely from the value as it ARRIVED, so
-     * a re-derivation by this script can never be reported as a user editing the field — and an
-     * external change arriving in the same save is still reported, under its own key, because the
-     * value it is compared against was captured before this script touched anything.
+     * THE TWO LOGGERS ARE KEPT DISJOINT BY TWO MECHANISMS, and both are needed:
+     *
+     *   1. The incoming type is read ONCE, before anything here can write to it. Everything
+     *      WI_TYPE_CHANGED reports is decided from that captured value, so a re-derivation
+     *      performed BELOW cannot be reported as a user edit, and the logged "to" value is
+     *      honest. Do not re-read the field after the re-derivation call.
+     *
+     *   2. The captured value is then tested with formExplainsType. This catches the case the
+     *      capture cannot: a re-derivation that happened in beforeLoad, on the edit page load,
+     *      arrives here as an already-changed value and is indistinguishable from an inline edit
+     *      by the capture alone. Asking whether the FORM EXPLAINS the new type separates them —
+     *      see formExplainsType, which is where the rule is stated.
+     *
+     * Mechanism 2 was added in 1.4.0 with the move of re-derivation to beforeLoad. Without it,
+     * every visible reclassification would also log WI_TYPE_CHANGED against the user who made it,
+     * which is exactly the false signal the separate WI_TYPE_REDERIVED key exists to prevent.
      *
      * @param {Object} context
      * @param {Object} context.newRecord
@@ -644,9 +865,15 @@ define(['N/search', 'N/runtime', 'N/log', './lib/wi_lib_config'],
             // separate WI_TYPE_REDERIVED key exists to prevent.
             var incomingValue = context.newRecord.getValue({ fieldId: field });
 
-            // EDIT only — see rederiveTypeOnFormChange for why XEDIT is excluded.
+            // EDIT only — see rederiveTypeOnFormChange for why XEDIT is excluded. Returns the
+            // configuration for the current form when it looked one up, so the check below does
+            // not pay for the same search twice.
+            var formConfig = null;
+
             if (context.type === context.UserEventType.EDIT) {
-                rederiveTypeOnFormChange(context.oldRecord, context.newRecord, incomingValue);
+                formConfig = rederiveTypeOnFormChange(
+                    context.oldRecord, context.newRecord, incomingValue
+                );
             }
 
             // Blank -> populated is the safety net working. Not an event.
@@ -658,6 +885,15 @@ define(['N/search', 'N/runtime', 'N/log', './lib/wi_lib_config'],
                 return;
             }
 
+            // The type changed. Before reporting that as somebody editing a read-only field, ask
+            // the only question that tells the two apart. A type that agrees with its form is a
+            // re-derivation — this script's own work, already logged as WI_TYPE_REDERIVED at the
+            // site that did it. Reaching here costs one small search, and only on the rare save
+            // where the type actually moved.
+            if (formExplainsType(context.newRecord, incomingValue, formConfig)) {
+                return;
+            }
+
             var user = runtime.getCurrentUser();
 
             log.audit({
@@ -665,7 +901,8 @@ define(['N/search', 'N/runtime', 'N/log', './lib/wi_lib_config'],
                 details: 'Task id ' + context.newRecord.id + ': work instruction type changed ' +
                     'from ' + JSON.stringify(oldValue) + ' to ' + JSON.stringify(incomingValue) +
                     ' by ' + (user ? user.name + ' (id ' + user.id + ')' : 'an unknown user') +
-                    '. The change was NOT blocked.'
+                    '. The new value does NOT match the configuration for this Task\'s form, so ' +
+                    'this was not a re-derivation. The change was NOT blocked.'
             });
 
         } catch (e) {
