@@ -79,11 +79,11 @@ form, it is searchable.
 
 | Component | Version | File | Purpose | Status |
 |---|---|---|---|---|
-| Shared config library | 1.2.0 | `lib/wi_lib_config.js` | All script IDs, plus the only reads of `customrecord_wi_config` | Not deployed |
+| Shared config library | 1.4.0 | `lib/wi_lib_config.js` | All script IDs, plus the only reads of `customrecord_wi_config` | Not deployed |
 | Source button user event | 1.1.0 | `wi_ue_source_button.js` | "Create Work Instruction" button on Opportunity and Customer | Not deployed |
 | Source button client script | 1.0.0 | `wi_cs_source_button.js` | Handles the button click. Required — see section 5 | Not deployed |
 | Picker Suitelet | 1.0.0 | `wi_sl_picker.js` | Choose the work instruction, open a Task on its form | Not deployed |
-| Task prefill user event | 1.0.0 | `wi_ue_task_prefill.js` | `beforeLoad` value application on a new Task | Not deployed |
+| Task prefill user event | 1.2.0 | `wi_ue_task_prefill.js` | Four-path prefill and recovery; `beforeSubmit` save-time recovery and type-change logging | Not deployed |
 
 All paths are relative to `src/FileCabinet/SuiteScripts/WorkInstructions/`.
 
@@ -229,6 +229,56 @@ through the pre-creation path instead.
   - **The Task opens at full tab width, not inside the popup.** A NetSuite Task form in a 520px
     window is unusable. The picker is a chooser, not a workspace.
 
+- **Verified in Sandbox, 2026-08-20 — do not re-litigate these:**
+  - `url.resolveTaskLink({ id: 'EDIT_TASK' })` **works.** Tasks open on the correct form. It is the
+    right way to get a new-Task URL; there is no `N/url` call that builds one from a record type.
+  - **The hidden picker URL field is readable in view mode.** The button could not have navigated
+    otherwise. The `custpage` hidden-field pattern is sound here.
+
+- **The four prefill paths, and what each one is allowed to touch:**
+
+  | Path | Trigger | Type | Priority / due date / assignee | Company / transaction |
+  |---|---|---|---|---|
+  | **1 — picker** | `beforeLoad` CREATE, config id parameter present | From the parameter | From the config | From the source record |
+  | **2 — form recovery** | `beforeLoad` CREATE, no parameter, form maps to one config | From the form, **always** | Re-applied in full if the type **changed** on this load; otherwise only the empty ones | Untouched |
+  | **3 — save-time recovery** | `beforeSubmit` **CREATE only**, type still empty | From the form | Only the empty ones | Untouched |
+  | **4 — no match** | Any | Untouched | Untouched | Untouched |
+
+- **The form is authoritative on path 2.** Change the form, and the type and the derived values
+  follow it. An only-when-empty rule on the type would leave it naming the form the user just
+  abandoned.
+
+- **Switching forms mid-create overwrites values the user may have typed.** Accepted deliberately:
+  those values were derived from the previous configuration and are stale the moment the type
+  moves — leaving one queue's assignee on another queue's work is exactly the mis-routing this
+  exists to fix. The path is rare, the result is coherent, and every field is re-editable on the
+  page in front of the user.
+
+- **Save-time recovery is CREATE only**, never EDIT. On EDIT it would search the configuration
+  record on every Task edit in the account where the type happens to be blank, and would stamp
+  values onto an old Task somebody opened for an unrelated reason. Backfilling history is a
+  deliberate one-off job, not a side effect of someone fixing a typo. XEDIT is excluded regardless:
+  `newRecord` is sparse on inline edit and `customform` may not be present.
+
+- **A negative due date offset is treated as unset**, and logged as `WI_OFFSET_INVALID`. A due date
+  in the past is never what anyone meant, and applying it silently produces a Task that is overdue
+  the moment it is created — which reads as a bug in this feature rather than an error in the
+  configuration.
+
+- **The form-to-type safety net is deliberate in four ways:**
+  - **An ambiguous form mapping yields `null`, never a guess.** If two active config records claim
+    the same form internal ID, the type is left blank and `WI_FORM_AMBIGUOUS` names both. Stamping
+    a wrong type silently corrupts the reports this feature exists to produce, and nobody would
+    know to look. A visible gap beats invisible wrong data.
+  - **The reverse lookup sets ONLY the type field.** A hand-created Task has already had its due
+    date, assignee and priority set by whoever created it. Overwriting them would be destructive.
+  - **`WI_FORM_UNMAPPED` logs at debug, not error.** Volume, not indifference — most Tasks in the
+    account have nothing to do with this feature, and an error line on each would bury real
+    problems.
+  - **Type changes are logged, not blocked.** The field is Inline Text on the forms, so any change
+    comes from inline edit, CSV or a script. Blocking would turn a visible, investigable event into
+    a support ticket about a Task that will not save.
+
 - **`log.warn()` does not exist in SuiteScript.** Use `log.debug()`. Calling `log.warn()` throws.
 - **`search.lookupFields()` fails on computed fields.** Use `record.load().getValue()` for
   anything derived, formula-based or summary.
@@ -245,8 +295,15 @@ through the pre-creation path instead.
 
 ## 6. Known issues and limitations
 
-Nothing recorded yet. Add entries here as they are found, with the date and the script version
-they were observed on.
+| Item | Detail |
+|---|---|
+| **Suitelet access does not imply Task create permission** | Both the button user event and the picker Suitelet deploy to **All Roles**. A role without the Tasks permission will reach the picker, choose a work instruction, and then **fail at the Task itself**. The picker cannot detect this in advance. If users report "the picker works but the Task will not open", check their role's Tasks permission before looking at this code. |
+| **CSV imports and integrations are covered only conditionally** | Save-time recovery runs in `beforeSubmit`, which CSV import fires **only when "Run Server SuiteScript and Trigger Workflows" is ticked on the import**. Untick it and nothing runs — no type, no prefill, no log. The same applies to any integration that suppresses user events. This is a NetSuite setting on each import, not something the scripts can detect or force. |
+| **`priority` can never be seen as empty** | NetSuite defaults a new Task to Medium, and nothing can tell that default apart from a user who chose Medium. So the only-when-empty rule never applies to priority: on path 2 it is set when the type changes (`force`), and on **path 3 it is effectively never set at all**. A CSV-imported Task therefore gets its type, due date and assignee but keeps whatever priority the import gave it. |
+| **Switching away to an unmapped form leaves a stale type** | Change the form from a work instruction form to one that maps to no config record, and path 4 touches nothing — so the previously derived type stays in place and now disagrees with the form. Clearing it would be destructive in other scenarios, so it is left alone and logged at debug. Worth knowing about; not worth code to prevent. |
+| **Historical Tasks are not backfilled** | Recovery runs on create only. Tasks that already exist without a type keep none until something else fills them in. See section 10. |
+
+Add further entries as they are found, with the date and the script version they were observed on.
 
 ---
 
@@ -271,9 +328,15 @@ string.
 | `WI_BUTTON_FAILED` | The button could not be drawn on an Opportunity or Customer. The record still opened. | Read the logged error. Users cannot raise work instructions from that record until fixed. |
 | `WI_BUTTON_URL_MISSING` | **Console only.** The button was clicked but the hidden picker URL field was empty. The user saw an apology rather than a blank page. | The user event drew the button but not the field. Check `beforeLoad` completed — a `WI_BUTTON_FAILED` entry in the Script Execution Log usually precedes this. |
 | `WI_BUTTON_CLICK_FAILED` | **Console only.** The client-side button handler threw. | Read the browser console. |
+| `WI_PREFILL_PATH` | Which of the three precedence paths a new Task took: 1 raised through the picker, 2 recovered from the form, 3 nothing to do. Normal operation. | Nothing. Use it to confirm the safety net is reaching the Tasks you expect. |
+| `WI_OFFSET_INVALID` | A config record's due date offset is **negative**. Treated as unset; the due date was left alone. | Correct the named configuration record. Until then, Tasks of that type are created with no due date. |
+| `WI_FORM_AMBIGUOUS` | **Error.** Two or more active config records claim the same form internal ID. The type was left blank rather than guessed. | Named in the log entry. Deactivate or repoint all but one, then fix the affected Tasks. Until then every Task on that form is created without a type. |
+| `WI_FORM_UNMAPPED` | **Debug, deliberately.** A Task's form maps to no single active config record. Nothing was set. Expected on most Tasks in the account. | Nothing, normally. Only investigate if it appears for a form you believe *is* configured. |
+| `WI_TYPE_CHANGED` | The work instruction type on a saved Task was changed away from an existing value. Records old value, new value, Task id and acting user. **The change was not blocked.** | Investigate if unexpected. The field is Inline Text on the forms, so the change came from inline edit, CSV or a script. |
+| `WI_BEFORE_SUBMIT_FAILED` | `beforeSubmit` threw — either save-time recovery or the type-change logger. The Task still saved. | Read the logged error. Neither recovery nor logging may stop a Task saving. |
 | `WI_POPUP_BLOCKED` | **Console only.** The browser blocked the picker popup, so it opened in place instead. Not a fault — the feature still works, but the user is navigated away from the source record. | Nothing required. If users hit it often, have them allow popups for the NetSuite domain. |
 | `WI_CONFIG_MISSING` | A Work Instruction Type record could not be read, or a required field on it was empty. | Check the configuration record exists in this account and is fully populated. See section 10. |
-| `WI_ROUTE_FAILED` | The work instruction could not be routed — form, assignee or due date could not be resolved. | Read the logged raw values. Usually a configuration gap rather than a code fault. |
+| `WI_ROUTE_FAILED` | **Reserved — no script raises this.** It was specified before the code existed; the failures it described are now reported more precisely by `WI_CONFIG_MISSING`, `WI_CONFIG_INCOMPLETE`, `WI_FORM_AMBIGUOUS` and `WI_PREFILL_FAILED`. Kept only so a future session grepping for it finds this note rather than hunting for a missing logger. | Nothing. Search the four keys above instead. |
 | `WI_PRIORITY_UNMAPPED` | The raw value of `custrecord_wi_default_priority` did not map to `HIGH`, `MEDIUM` or `LOW`. Priority was left unset — deliberately, not silently. | Read the logged raw value. Either the config record holds an unexpected option, or the normalisation rule is wrong. See section 4. |
 
 Populate further keys as scripts are written. Log the **raw value** alongside every one of these,
@@ -298,7 +361,7 @@ Deployment is **manual File Cabinet upload**. There is no SDF project and no aut
    |---|---|---|
    | `wi_sl_picker.js` | `customscript_wi_sl_picker` | `customdeploy_wi_sl_picker`. **Available Without Login: No.** |
    | `wi_ue_source_button.js` | `customscript_wi_ue_source_button` | **Two deployments from one script record** — Opportunity and Customer |
-   | `wi_ue_task_prefill.js` | `customscript_wi_ue_task_prefill` | One deployment, Task |
+   | `wi_ue_task_prefill.js` | `customscript_wi_ue_task_prefill` | One deployment, Task. **Both `beforeLoad` and `beforeSubmit` are entry points from 1.1.0** — no extra deployment, but the script record must not restrict which functions run |
    | `wi_cs_source_button.js` | — | **None.** Attached by the user event via `clientScriptModulePath`. Upload only — creating a script record for it is wrong |
 
    The picker's script and deployment IDs are referenced by `url.resolveScript()` in
@@ -306,7 +369,15 @@ Deployment is **manual File Cabinet upload**. There is no SDF project and no aut
    button will throw when it builds its URL.
 4. Confirm the Work Instruction Configuration records exist and are populated **in the target
    account**. They are data, so they do not travel with the code.
-5. Set the Suitelet deployment's audience. Not yet decided — see section 10, question 8.
+5. Set the deployment audiences:
+
+   | Deployment | Audience |
+   |---|---|
+   | `wi_ue_source_button.js` (both deployments) | **All Roles** |
+   | `wi_sl_picker.js` | **All Roles**, and **Available Without Login: No** |
+
+   All Roles is deliberate. Note the limitation in section 6: reaching the picker does not grant
+   permission to create a Task.
 
 Shared AMD modules need no script record and no deployment record — a File Cabinet upload is
 sufficient. But **all files must sit in the same folder tree**, because the imports are relative
@@ -355,7 +426,23 @@ Grep the execution log for `WI_` after every scenario.
 | 16 | Create a Task **the ordinary way**, without the button | Task opens untouched. No prefill, no error. Work instruction field empty — Phase 3 handles this |
 | 17 | Build a saved search on `custevent_work_instruction_type` | Tasks raised via the picker appear, grouped by type. **This is the reporting failure the project exists to fix** |
 | 18 | A config record whose priority text is not High/Medium/Low | Priority **unset**, `WI_PRIORITY_UNMAPPED` logs both the text and the internal ID |
-| 19 | Confirm the picker link target | **Verify `url.resolveTaskLink({id: 'EDIT_TASK'})` resolves to the new-Task page.** If the link id is wrong the links 404 — loud and immediate, but check it first |
+| 19 | Confirm the picker link target | **Verified 2026-08-20** — `url.resolveTaskLink({id: 'EDIT_TASK'})` resolves correctly and Tasks open on the right form |
+| 20 | Raise a Task **through the picker** | Full prefill, unchanged from 1.0.0. `WI_PREFILL_PATH` reports path 1 |
+| 21 | Create a Task with the **ordinary New Task button**, on a work instruction form | Type **populated**. Priority, due date, assignee, company and transaction **untouched**. `WI_PREFILL_PATH` reports path 2 |
+| 22 | Create a Task on a form mapping to **no** config record | Nothing set, no error, **no error-level log**. `WI_FORM_UNMAPPED` at debug only |
+| 23 | Create a Task that **already has a type** | Existing value **not overwritten** |
+| 24 | Change the type on a saved Task by **inline edit** | Change **succeeds**. `WI_TYPE_CHANGED` in the execution log with old value, new value and user |
+| 25 | Temporarily point **two config records at the same form internal ID**, then create a Task on that form | Type left **blank**. `WI_FORM_AMBIGUOUS` fires at error level naming **both** records. **Revert the config afterwards** |
+| 26 | New Task on the default form, switch to *Redraw Required* | Type, priority, due date and assignee **all populate on screen** |
+| 27 | Change the assignee by hand, then reload the **same** form | The hand-set assignee **survives** |
+| 28 | Switch from *Redraw Required* to *Measure Plans* | All four values **update** to Measure Plans' configuration |
+| 29 | Switch to a form with **no** config record | Nothing further set, previous values remain, **debug log only**. Note the stale type described in section 6 |
+| 30 | Save the Task from scenario 26 | Values persist as shown |
+| 31 | Raise a Task through the picker | `beforeSubmit` exits immediately — **no second recovery** in the log |
+| 32 | CSV import a Task on a work instruction form, **"Run Server SuiteScript" ticked** | Type and empty fields populated. Priority is **not** set — see section 6 |
+| 33 | The same import **unticked** | Nothing set. **This is expected**, not a fault |
+| 34 | Set a config offset to a **negative** number and raise it | Due date **untouched**, `WI_OFFSET_INVALID` logged. **Revert the config afterwards** |
+| 35 | Edit an old untyped Task and save | Nothing set, **no config search runs** |
 
 ---
 
@@ -394,6 +481,9 @@ read. See trap 6 in section 0.
 | 3 | Does a workflow remain as a server-side safety net? | **No.** Retired and being deleted. These scripts are the only writer. See section 5. | 2026-08-20 |
 | 4 | Is the priority field a native or a hand-built list? | **Never established, and it does not matter.** Read as text, which is correct either way. See section 4. | 2026-08-20 |
 | 5 | Which sales rep? | The **source record's own** `salesrep`. No cross-record fallback. | 2026-08-20 |
+| 8 | Which roles see the button and may run the Suitelet? | **All Roles** for both. Suitelet stays Available Without Login: No. See section 8, and the permission limitation in section 6. | 2026-08-20 |
+| — | Should recovery run on EDIT, backfilling history opportunistically? | **No.** It would search the config record on every Task edit in the account where the type is blank, and stamp values onto records opened for unrelated reasons. Backfill is a deliberate one-off job. See section 5. | 2026-08-20 |
+| — | What should a negative due date offset do? | **Treated as unset**, and logged as `WI_OFFSET_INVALID`. See section 5. | 2026-08-20 |
 | 6 | Is there a Task field holding the sourced offset? | **No**, and none needed. | 2026-08-20 |
 | 7 | Which Task field links back to the source? | Native `company` and `transaction`. No custom field. See section 4. | 2026-08-20 |
 
@@ -403,11 +493,21 @@ read. See trap 6 in section 0.
 |---|---|---|
 | 1 | Button on Opportunity only, or Customer as well? | **Open.** Built for both — one script record, two deployments. Dropping Customer means removing a deployment, not changing code. |
 | 2 | Does the picker let the user override assignee and priority, or set them silently? | **Open.** Currently silent: the picker is a one-click list and the user edits the Task afterwards. |
-| 8 | Which roles see the button and may run the picker Suitelet? | **Open.** A deployment-time decision, not a code decision — set the audience on the deployment records. The Suitelet must be **Available Without Login: No**. |
 
-### Carried into Phase 3
 
-| Item | Why it is not in this phase |
+### NetSuite configuration tasks for Steve
+
+Not code. These are account changes that the scripts assume have been made.
+
+| # | Task | Why it matters |
+|---|---|---|
+| 1 | Set `custevent_work_instruction_type` to **Inline Text** on all Task forms | Users must not be able to edit it. `beforeSubmit` logs changes rather than blocking them precisely because the field is expected to be read-only in the UI — if it is editable, `WI_TYPE_CHANGED` will fire on ordinary user edits and the signal is lost. |
+| 2 | Mark `custrecord_wi_default_form_type` **Inactive** | The mis-built field. Trap 6 in section 0 warns against it, but inactive is better than documented. |
+| 3 | Confirm the routing **workflow has been deleted** | Section 5 records it as retired. Confirm rather than assume — if it still runs, there are two writers of the type field and the ordering question comes back. |
+
+### Still open
+
+| Item | Status |
 |---|---|
-| Reverse lookup from custom form to work instruction type | A Task created without the picker carries no work instruction type and stays invisible to reporting. `wi_ue_task_prefill.js` returns immediately when the config parameter is absent. |
 | Task title refinement | Currently the config record name alone. Provisional pending Steve seeing it in use. |
+| Backfilling historical Tasks | **Still open, and deliberately not automated.** Recovery runs on create only — see the reasoning in section 5. If it is ever wanted, the method is: a saved search of Tasks on a work instruction form with no work instruction type, then a one-off Map/Reduce or a CSV update. A one-off job, run knowingly. |

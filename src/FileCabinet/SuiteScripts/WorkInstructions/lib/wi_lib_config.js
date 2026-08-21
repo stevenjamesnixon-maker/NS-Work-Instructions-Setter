@@ -16,13 +16,13 @@
  *
  * @NApiVersion 2.1
  * @NModuleScope SameAccount
- * @version 1.2.0
+ * @version 1.4.0
  */
 define(['N/search', 'N/error', 'N/log'], function (search, error, log) {
 
     'use strict';
 
-    var VERSION = '1.2.0';
+    var VERSION = '1.4.0';
 
     /* ---------------------------------------------------------------------------------------
      * CONFIRMED NETSUITE IDS
@@ -91,6 +91,8 @@ define(['N/search', 'N/error', 'N/log'], function (search, error, log) {
      * @type {Object}
      */
     var TASK_NATIVE_FIELDS = {
+        /** The custom form the Task is rendered on. Readable at runtime; NOT searchable. */
+        CUSTOM_FORM: 'customform',
         TITLE: 'title',
         PRIORITY: 'priority',
         DUE_DATE: 'duedate',
@@ -200,6 +202,31 @@ define(['N/search', 'N/error', 'N/log'], function (search, error, log) {
     }
 
     /**
+     * Normalises a form internal ID to a comparable string.
+     *
+     * The two sides arrive in different shapes: getValue('customform') returns a STRING, while
+     * custrecord_wi_form_internal_id is an INTEGER field. Both are normalised here rather than
+     * left to JavaScript's type coercion, which would treat a padded or decimal-suffixed form id
+     * as unequal to the same id as a plain number in some comparisons and equal in others.
+     *
+     * @param {*} raw
+     * @returns {string|null}
+     */
+    function normaliseFormId(raw) {
+        var text = trimToNull(raw);
+        if (text === null) {
+            return null;
+        }
+
+        var asNumber = Number(text);
+        if (isFinite(asNumber) && Math.floor(asNumber) === asNumber) {
+            return String(asNumber);
+        }
+
+        return text;
+    }
+
+    /**
      * Normalises the configured priority to a native Task priority value.
      *
      * The priority column is read as TEXT rather than as an internal ID. The field type was never
@@ -246,6 +273,12 @@ define(['N/search', 'N/error', 'N/log'], function (search, error, log) {
      *   0                  -> due date is today. Deliberate and confirmed; several config
      *                         records use it intentionally.
      *   blank / non-numeric -> null, meaning leave the due date field alone entirely.
+     *   NEGATIVE           -> invalid. Treated exactly as blank, and logged as
+     *                         WI_OFFSET_INVALID. A due date in the past is never what anyone
+     *                         meant; applying it silently produces a Task that is overdue the
+     *                         moment it is created, which reads as a bug in this feature rather
+     *                         than an error in the configuration. Refusing it and saying so
+     *                         turns it into a five-second fix.
      *
      * Blank is tested for EXPLICITLY rather than by truthiness. 0 is falsy in JavaScript, so an
      * `if (offset)` check would silently skip the due date on exactly the records that legitimately
@@ -268,6 +301,17 @@ define(['N/search', 'N/error', 'N/log'], function (search, error, log) {
                 title: LOG_PREFIX + 'CONFIG_INCOMPLETE',
                 details: 'Config "' + configName + '" (id ' + configId + '): due date offset ' +
                     JSON.stringify(raw) + ' is not a whole number. Due date left alone.'
+            });
+            return null;
+        }
+
+        if (days < 0) {
+            log.audit({
+                title: LOG_PREFIX + 'OFFSET_INVALID',
+                details: 'Config "' + configName + '" (id ' + configId + '): due date offset ' +
+                    JSON.stringify(raw) + ' is negative, which would create a Task that is ' +
+                    'already overdue. Treated as unset; the due date was left alone. Correct ' +
+                    'the configuration record.'
             });
             return null;
         }
@@ -411,6 +455,80 @@ define(['N/search', 'N/error', 'N/log'], function (search, error, log) {
         return found;
     }
 
+    /**
+     * The single ACTIVE configuration record whose form internal ID matches, or null.
+     *
+     * This is the safety net for a Task raised outside the picker: the user still chose the right
+     * form, so the work instruction type can be recovered from it.
+     *
+     * THREE OUTCOMES, and the middle one will look wrong to a fresh reader:
+     *
+     *   exactly one match  -> that config object
+     *   no match           -> null, quietly. NOT an error: most Tasks in the account have nothing
+     *                         to do with this feature.
+     *   more than one      -> null, and WI_FORM_AMBIGUOUS at ERROR level naming every match.
+     *
+     * On ambiguity this deliberately does NOT pick one. Stamping a wrong work instruction type
+     * silently corrupts the exact reports this feature exists to produce, and nobody would ever
+     * know to look. Leaving the field blank surfaces the Task in a data-quality search and gets it
+     * fixed. A visible gap beats invisible wrong data. Do not "improve" this into a first-match.
+     *
+     * @param {string|number} formInternalId - typically from getValue('customform'), a string
+     * @returns {Object|null} config object, shape as getActiveTypes()
+     */
+    function getByFormId(formInternalId) {
+        var wanted = normaliseFormId(formInternalId);
+
+        if (wanted === null) {
+            return null;
+        }
+
+        var matches = [];
+
+        search.create({
+            type: CONFIG_RECORD_TYPE,
+            filters: [
+                ['isinactive', 'is', 'F'],
+                'AND',
+                [CONFIG_FIELDS.FORM_INTERNAL_ID, 'equalto', wanted]
+            ],
+            columns: configColumns()
+        }).run().each(function (result) {
+            // The filter above has already narrowed the set, but it compares NetSuite-side with
+            // NetSuite's own coercion rules. Re-check here against the normalised value so that
+            // both sides of the comparison have been through the same function.
+            var candidate = normaliseFormId(result.getValue({ name: CONFIG_FIELDS.FORM_INTERNAL_ID }));
+
+            if (candidate === wanted) {
+                matches.push(mapRow(result));
+            }
+
+            return true;
+        });
+
+        if (matches.length === 0) {
+            return null;
+        }
+
+        if (matches.length > 1) {
+            var named = [];
+            var i;
+            for (i = 0; i < matches.length; i += 1) {
+                named.push('"' + matches[i].name + '" (id ' + matches[i].id + ')');
+            }
+
+            log.error({
+                title: LOG_PREFIX + 'FORM_AMBIGUOUS',
+                details: 'Form internal id ' + wanted + ' is claimed by ' + matches.length +
+                    ' active configuration records: ' + named.join(', ') + '. The work instruction ' +
+                    'type was left blank rather than guessed. Deactivate or repoint all but one.'
+            });
+            return null;
+        }
+
+        return matches[0];
+    }
+
     return {
         VERSION: VERSION,
         CONFIG_RECORD_TYPE: CONFIG_RECORD_TYPE,
@@ -426,7 +544,8 @@ define(['N/search', 'N/error', 'N/log'], function (search, error, log) {
         LOG_PREFIX: LOG_PREFIX,
         TASK_PRIORITIES: TASK_PRIORITIES,
         getActiveTypes: getActiveTypes,
-        getByTypeId: getByTypeId
+        getByTypeId: getByTypeId,
+        getByFormId: getByFormId
     };
 
 });

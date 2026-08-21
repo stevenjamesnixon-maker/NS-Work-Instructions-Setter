@@ -10,21 +10,25 @@
  * touches the form: switching the form on a rendered record clears the very fields set below.
  * See docs/context.md section 0, trap 2.
  *
- * A Task created by any other route is left untouched in this phase. Deriving the work instruction
- * type by reverse lookup from the form is Phase 3.
+ * A Task created outside the picker still has the right custom form, because the user chose it.
+ * The work instruction type is therefore recovered from the form — see deriveTypeFromForm below.
+ * Only the type is recovered; nothing else on such a Task is touched.
+ *
+ * beforeSubmit logs changes to the work instruction type. It does not block them.
  *
  * House style is ES5 throughout — var, function, 'use strict'. Deliberate. Do not modernise.
  *
  * @NApiVersion 2.1
  * @NScriptType UserEventScript
  * @NModuleScope SameAccount
- * @version 1.0.0
+ * @version 1.2.0
  */
-define(['N/search', 'N/log', './lib/wi_lib_config'], function (search, log, wiConfig) {
+define(['N/search', 'N/runtime', 'N/log', './lib/wi_lib_config'],
+    function (search, runtime, log, wiConfig) {
 
     'use strict';
 
-    var VERSION = '1.0.0';
+    var VERSION = '1.2.0';
 
     /**
      * Reads a value from a search.lookupFields result. Select fields come back as an array of
@@ -103,48 +107,129 @@ define(['N/search', 'N/log', './lib/wi_lib_config'], function (search, log, wiCo
     }
 
     /**
-     * Applies the assignee rule and logs which branch was taken, with the raw configured value.
+     * True when a Task field currently holds nothing.
+     *
+     * NOTE: this can never be true for `priority`. NetSuite defaults a new Task to Medium, and
+     * there is no way to tell that default apart from a user who chose Medium. The consequence is
+     * recorded in docs/context.md section 6.
+     *
+     * @param {Object} newRecord
+     * @param {string} fieldId
+     * @returns {boolean}
+     */
+    function isFieldEmpty(newRecord, fieldId) {
+        var current = newRecord.getValue({ fieldId: fieldId });
+        return current === null || current === undefined || current === '';
+    }
+
+    /**
+     * Are two NetSuite ids the same value? Compared as trimmed strings, because one side may
+     * arrive as a number and the other as a string.
+     *
+     * @param {*} a
+     * @param {*} b
+     * @returns {boolean}
+     */
+    function sameId(a, b) {
+        var left = (a === null || a === undefined) ? '' : String(a).replace(/^\s+|\s+$/g, '');
+        var right = (b === null || b === undefined) ? '' : String(b).replace(/^\s+|\s+$/g, '');
+        return left === right;
+    }
+
+    /**
+     * Chooses the assignee. Rule order:
      *
      *   1. Default Assignee populated on the config record -> use it.
      *   2. Otherwise -> the source record's own sales rep.
      *   3. Otherwise -> leave Assigned To empty.
      *
      * There is no cross-record fallback: an Opportunity uses the Opportunity's sales rep, a
-     * Customer uses the Customer's. If neither is set, the user assigns the Task by hand.
+     * Customer uses the Customer's. A hand-created Task has no source record at all, so it can
+     * only ever reach rule 1 or rule 3.
+     *
+     * @param {Object} config
+     * @param {Object} source
+     * @returns {Object} { value, rule }
+     */
+    function chooseAssignee(config, source) {
+        if (config.defaultAssignee !== null) {
+            return { value: config.defaultAssignee, rule: '1 (config default assignee)' };
+        }
+
+        if (source.salesRep !== null) {
+            return { value: source.salesRep, rule: '2 (source record sales rep)' };
+        }
+
+        return { value: null, rule: '3 (left empty)' };
+    }
+
+    /**
+     * THE ONE IMPLEMENTATION of "apply this configuration's values to this Task".
+     *
+     * Paths 1, 2 and 3 all route through here. Three copies of the assignee rule that have to
+     * agree with each other would be a latent bug, so there is exactly one copy.
+     *
+     * `force` decides what happens to a field that already holds something:
+     *
+     *   force === true   overwrite it. Used when the derived work instruction type CHANGED on
+     *                    this load: the old values were derived from the previous configuration
+     *                    and are stale the moment the type moves. Leaving one queue's assignee on
+     *                    another queue's work is exactly the mis-routing this exists to fix.
+     *   force === false  fill only what is empty, so a plain reload never clobbers what the user
+     *                    has typed.
+     *
+     * Company, transaction and title are NOT set here — they belong to path 1 only, which has a
+     * source record to link to.
      *
      * @param {Object} newRecord
      * @param {Object} config
-     * @param {Object} source
+     * @param {Object} source - { salesRep, customer }; empty for a hand-created Task
+     * @param {boolean} force
+     * @param {string} pathLabel - for the audit line
      * @returns {void}
      */
-    function applyAssignee(newRecord, config, source) {
-        var chosen = null;
-        var rule;
+    function applyConfigValues(newRecord, config, source, force, pathLabel) {
+        var fields = wiConfig.TASK_NATIVE_FIELDS;
 
-        if (config.defaultAssignee !== null) {
-            chosen = config.defaultAssignee;
-            rule = '1 (config default assignee)';
-        } else if (source.salesRep !== null) {
-            chosen = source.salesRep;
-            rule = '2 (source record sales rep)';
-        } else {
-            rule = '3 (left empty)';
+        if (config.priority !== null &&
+            (force || isFieldEmpty(newRecord, fields.PRIORITY))) {
+            newRecord.setValue({ fieldId: fields.PRIORITY, value: config.priority });
         }
 
-        if (chosen !== null) {
+        // Three states, and null is NOT the same as 0. A null offset means leave the due date
+        // alone; an offset of 0 means today. Testing truthiness here would silently skip the due
+        // date on every config record that legitimately wants today.
+        if (config.dueOffsetDays !== null &&
+            (force || isFieldEmpty(newRecord, fields.DUE_DATE))) {
             newRecord.setValue({
-                fieldId: wiConfig.TASK_NATIVE_FIELDS.ASSIGNED,
-                value: chosen
+                fieldId: fields.DUE_DATE,
+                value: dueDateFromOffset(config.dueOffsetDays)
             });
+        }
+
+        var assignee = chooseAssignee(config, source);
+
+        if (assignee.value !== null && (force || isFieldEmpty(newRecord, fields.ASSIGNED))) {
+            newRecord.setValue({ fieldId: fields.ASSIGNED, value: assignee.value });
         }
 
         log.audit({
             title: wiConfig.LOG_PREFIX + 'ASSIGNEE_RULE',
-            details: 'Config "' + config.name + '" (id ' + config.id + '): applied rule ' + rule +
+            details: pathLabel + ' — config "' + config.name + '" (id ' + config.id +
+                '): applied rule ' + assignee.rule + ', force=' + force +
                 '. Raw default assignee ' + JSON.stringify(config.defaultAssignee) +
                 ', source sales rep ' + JSON.stringify(source.salesRep) +
-                ', assigned ' + JSON.stringify(chosen) + '.'
+                ', chosen ' + JSON.stringify(assignee.value) + '.'
         });
+    }
+
+    /**
+     * A hand-created Task has no source record, so there is no sales rep and no customer to link.
+     *
+     * @returns {Object}
+     */
+    function emptySource() {
+        return { salesRep: null, customer: null };
     }
 
     /**
@@ -176,6 +261,77 @@ define(['N/search', 'N/log', './lib/wi_lib_config'], function (search, log, wiCo
     }
 
     /**
+     * Path 2 and path 3 of the precedence in beforeLoad.
+     *
+     * A Task raised outside the picker carries no work instruction type and is therefore invisible
+     * to every report this feature exists to produce. The custom form is still correct, because
+     * whoever created the Task chose it, so the type is recovered from the form.
+     *
+     * ONLY the type is set. Priority, due date, assignee, company and transaction are deliberately
+     * left alone: this is a Task somebody created by hand, and they have already set those values.
+     * Overwriting them would be destructive, and recovering a missing type is the whole job here.
+     *
+     * The field is set only when it is currently empty. An existing value is never overwritten.
+     *
+     * @param {Object} newRecord
+     * @returns {void}
+     */
+    function deriveTypeFromForm(newRecord) {
+        var formId = newRecord.getValue({
+            fieldId: wiConfig.TASK_NATIVE_FIELDS.CUSTOM_FORM
+        });
+
+        var existing = newRecord.getValue({
+            fieldId: wiConfig.TASK_FIELDS.WORK_INSTRUCTION_TYPE
+        });
+
+        var config = wiConfig.getByFormId(formId);
+
+        if (config === null) {
+            // Path 3. DEBUG, not error: most Tasks in the account have nothing to do with this
+            // feature, and an error-level line on every one of them would bury real problems.
+            // An ambiguous mapping has already logged WI_FORM_AMBIGUOUS at error level.
+            log.debug({
+                title: wiConfig.LOG_PREFIX + 'FORM_UNMAPPED',
+                details: 'Form internal id ' + JSON.stringify(formId) + ' maps to no single ' +
+                    'active configuration record. Nothing was set.'
+            });
+            return;
+        }
+
+        // The type is set UNCONDITIONALLY here, unlike everywhere else. On this path the FORM is
+        // the identity: if a user switches from one work instruction form to another mid-create
+        // the page reloads, and an only-when-empty rule would leave the type naming the form they
+        // just abandoned. The form is authoritative; the type follows it.
+        var typeChanged = !sameId(existing, config.id);
+
+        newRecord.setValue({
+            fieldId: wiConfig.TASK_FIELDS.WORK_INSTRUCTION_TYPE,
+            value: config.id
+        });
+
+        // When the type changed, priority, due date and assignee were derived from the PREVIOUS
+        // configuration and are stale — so they are re-applied from the new one. That does
+        // overwrite anything the user typed by hand before switching forms. Accepted deliberately:
+        // switching forms mid-create is rare, the result is coherent, and every one of these
+        // fields is trivially re-editable on the page in front of them.
+        //
+        // On a plain reload of the same form nothing changed, so only empty fields are filled and
+        // the user's own edits survive.
+        //
+        // Company and transaction stay untouched: a hand-created Task has no source record to
+        // link to. The user sets Company themselves if they want it.
+        applyConfigValues(newRecord, config, emptySource(), typeChanged, 'Path 2 (form recovery)');
+
+        log.audit({
+            title: wiConfig.LOG_PREFIX + 'PREFILL_PATH',
+            details: 'Path 2: recovered from form internal id ' + JSON.stringify(formId) +
+                ' as "' + config.name + '" (id ' + config.id + '). Type changed on this load: ' +
+                typeChanged + '. Company and transaction untouched.'
+        });
+    }
+
+    /**
      * @param {Object} context
      * @param {Object} context.newRecord
      * @param {Object} context.request
@@ -201,10 +357,16 @@ define(['N/search', 'N/log', './lib/wi_lib_config'], function (search, log, wiCo
 
             var configId = parameters[wiConfig.URL_PARAMS.CONFIG_ID];
             if (!configId) {
-                // A Task created any other way is untouched in this phase. Phase 3 adds the
-                // reverse lookup from custom form to work instruction type.
+                // Path 2 or 3: no picker parameter, so try to recover the type from the form.
+                deriveTypeFromForm(context.newRecord);
                 return;
             }
+
+            log.audit({
+                title: wiConfig.LOG_PREFIX + 'PREFILL_PATH',
+                details: 'Path 1: raised through the picker with config id ' + configId + '. ' +
+                    'Full prefill applied.'
+            });
 
             var sourceType = parameters[wiConfig.URL_PARAMS.SOURCE_TYPE] || '';
             var sourceId = parameters[wiConfig.URL_PARAMS.SOURCE_ID] || '';
@@ -224,24 +386,9 @@ define(['N/search', 'N/log', './lib/wi_lib_config'], function (search, log, wiCo
                 value: config.name
             });
 
-            if (config.priority !== null) {
-                newRecord.setValue({
-                    fieldId: wiConfig.TASK_NATIVE_FIELDS.PRIORITY,
-                    value: config.priority
-                });
-            }
-
-            // Three states, and null is NOT the same as 0. A null offset means leave the due date
-            // alone; an offset of 0 means today. Testing truthiness here would silently skip the
-            // due date on every config record that legitimately wants today.
-            if (config.dueOffsetDays !== null) {
-                newRecord.setValue({
-                    fieldId: wiConfig.TASK_NATIVE_FIELDS.DUE_DATE,
-                    value: dueDateFromOffset(config.dueOffsetDays)
-                });
-            }
-
-            applyAssignee(newRecord, config, source);
+            // Path 1 forces: everything on the Task came from the picker a moment ago, so there
+            // is nothing of the user's to preserve.
+            applyConfigValues(newRecord, config, source, true, 'Path 1 (picker)');
             applySourceLinks(newRecord, sourceType, sourceId, source);
 
         } catch (e) {
@@ -255,9 +402,156 @@ define(['N/search', 'N/log', './lib/wi_lib_config'], function (search, log, wiCo
         }
     }
 
+
+    /**
+     * Path 3 — save-time recovery. CREATE only.
+     *
+     * beforeLoad never fires for a CSV import or for most integrations, so a Task arriving by
+     * those routes reaches beforeSubmit with no work instruction type. This is the only place
+     * that catches them.
+     *
+     * NOTE the condition NetSuite imposes: a CSV import fires user events ONLY when "Run Server
+     * SuiteScript and Trigger Workflows" is ticked on the import. Untick it and nothing here runs.
+     * See docs/context.md section 6.
+     *
+     * WHY CREATE ONLY, and not EDIT:
+     *
+     *   - On EDIT this would search the configuration record on every Task edit in the account
+     *     where the type happens to be blank — every unrelated Task anybody touches. The benefit
+     *     is opportunistic backfill of history; the cost is a search on work that has nothing to
+     *     do with this feature.
+     *   - It would also stamp values onto an old Task somebody opened for an entirely unrelated
+     *     reason, silently. Backfilling history is a deliberate one-off job, not a side effect of
+     *     someone fixing a typo.
+     *
+     * XEDIT is excluded regardless: newRecord is sparse on inline edit and customform may not be
+     * present at all.
+     *
+     * In the common case this exits on ONE getValue — a Task raised through the picker already
+     * had its type set in beforeLoad, so the check finds it populated and returns without a
+     * search.
+     *
+     * @param {Object} newRecord
+     * @returns {void}
+     */
+    function recoverTypeOnSave(newRecord) {
+        var existing = newRecord.getValue({
+            fieldId: wiConfig.TASK_FIELDS.WORK_INSTRUCTION_TYPE
+        });
+
+        if (existing) {
+            // Already typed — by the picker, by beforeLoad, or by the importer. Nothing to do,
+            // and deliberately nothing logged: this is the common case on every saved Task.
+            return;
+        }
+
+        var formId = newRecord.getValue({
+            fieldId: wiConfig.TASK_NATIVE_FIELDS.CUSTOM_FORM
+        });
+
+        var config = wiConfig.getByFormId(formId);
+
+        if (config === null) {
+            log.debug({
+                title: wiConfig.LOG_PREFIX + 'FORM_UNMAPPED',
+                details: 'Path 3: form internal id ' + JSON.stringify(formId) + ' maps to no ' +
+                    'single active configuration record. Nothing was set.'
+            });
+            return;
+        }
+
+        newRecord.setValue({
+            fieldId: wiConfig.TASK_FIELDS.WORK_INSTRUCTION_TYPE,
+            value: config.id
+        });
+
+        // Only what is empty. Whoever created this Task may have set values deliberately, and
+        // there is no previous configuration here whose values could have gone stale.
+        applyConfigValues(newRecord, config, emptySource(), false, 'Path 3 (save-time recovery)');
+
+        log.audit({
+            title: wiConfig.LOG_PREFIX + 'PREFILL_PATH',
+            details: 'Path 3: recovered at save from form internal id ' + JSON.stringify(formId) +
+                ' as "' + config.name + '" (id ' + config.id + '). Empty fields filled only.'
+        });
+    }
+
+    /**
+     * Two jobs, split by event type:
+     *
+     *   CREATE        -> path 3, save-time recovery. See recoverTypeOnSave.
+     *   EDIT / XEDIT  -> record changes to the work instruction type.
+     *
+     * The second is VISIBILITY, NOT ENFORCEMENT.
+     *
+     * The field is Inline Text on the Task forms, so a user cannot edit it there. Any change
+     * therefore arrives by inline edit from a list, by CSV update, or from another script — and
+     * Steve needs to SEE those rather than have them prevented. Blocking the change would turn a
+     * visible, investigable event into a support ticket about a Task that will not save.
+     *
+     * Only a change away from an existing value is logged. Filling in a blank is the safety net
+     * doing its job, not an event worth reporting.
+     *
+     * @param {Object} context
+     * @param {Object} context.newRecord
+     * @param {Object} context.oldRecord
+     * @param {string} context.type
+     * @returns {void}
+     */
+    function beforeSubmit(context) {
+        try {
+            // Path 3 runs here and nowhere else, then stops: there is no old value to compare
+            // against on a create, so the type-change logging below cannot apply.
+            if (context.type === context.UserEventType.CREATE) {
+                recoverTypeOnSave(context.newRecord);
+                return;
+            }
+
+            if (context.type !== context.UserEventType.EDIT &&
+                context.type !== context.UserEventType.XEDIT) {
+                return;
+            }
+
+            if (!context.oldRecord || !context.newRecord) {
+                return;
+            }
+
+            var field = wiConfig.TASK_FIELDS.WORK_INSTRUCTION_TYPE;
+            var oldValue = context.oldRecord.getValue({ fieldId: field });
+            var newValue = context.newRecord.getValue({ fieldId: field });
+
+            // Blank -> populated is the safety net working. Not an event.
+            if (!oldValue) {
+                return;
+            }
+
+            if (String(oldValue) === String(newValue)) {
+                return;
+            }
+
+            var user = runtime.getCurrentUser();
+
+            log.audit({
+                title: wiConfig.LOG_PREFIX + 'TYPE_CHANGED',
+                details: 'Task id ' + context.newRecord.id + ': work instruction type changed ' +
+                    'from ' + JSON.stringify(oldValue) + ' to ' + JSON.stringify(newValue) +
+                    ' by ' + (user ? user.name + ' (id ' + user.id + ')' : 'an unknown user') +
+                    '. The change was NOT blocked.'
+            });
+
+        } catch (e) {
+            // Neither recovery nor logging may stop a Task saving.
+            log.error({
+                title: wiConfig.LOG_PREFIX + 'BEFORE_SUBMIT_FAILED',
+                details: (e.name || '') + ': ' + (e.message || e)
+            });
+        }
+    }
+
     return {
         VERSION: VERSION,
-        beforeLoad: beforeLoad
+        beforeLoad: beforeLoad,
+        beforeSubmit: beforeSubmit
     };
 
 });
